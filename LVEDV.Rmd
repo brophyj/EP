@@ -1,0 +1,373 @@
+---
+title: "LVEDV"
+author: "Omar Abdullah Gill"
+date: "2026-04-11"
+output: html_document
+---
+#Loading of all packages 
+```{r}
+pacman::p_load(bayesmeta,          # Bayesian Meta-Analysis
+               BayesianPriorsTool, # Priors Building Tool
+               dplyr,              # Data Wrangle
+               tidyr,              # Data Wrangle
+               meta,               # Forest Plot
+               metafor,            # Effect Sizes
+               ggdist,             # Distributions
+               ggplot2,            # Plots
+               patchwork,          # Plots
+               here,
+               readxl,             # Import data
+               gt)  
+
+# ggplot2 theme
+theme_set(
+  theme(
+    plot.title.position = 'plot',
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(color = "gray80", linewidth = 0.3)
+  )
+)
+```
+
+Updated data with recent trial Physio-synch, 2026
+```{r}
+
+lvedv_df <- data.frame(
+  study = c("Lustgarten, 2015", "Upadhyay, 2019", "Vinther 2021", "Pujol-Lopez 2022", "Vijayaraman 2023", "Wang 2022", "Physio-Synch trial 2026"),
+  
+  subgroup = c("HBP", "HBP", "HBP", "LBAP", "LBAP", "LBAP", "LBAP"),
+  
+  # CSP Group (Intervention)
+  m1 = c(118.00, -22.00, 74.00, -37.00, 102.00, -77.74, 175.00),
+  sd1   = c(52.00, 24.00, 30.00, 59.00, 52.00, 7.80, 77.00),
+  n1    = c(12, 16, 25, 35, 50, 20, 87),
+  
+  # BVP Group (Control)
+  m2= c(126.00, -19.00, 79.00, -30.00, 107.00, -55.58, 171.00),
+  sd2   = c(74.00, 14.00, 29.00, 41.00, 51.00, 8.80, 90.00),
+  n2    = c(12, 24, 25, 35, 50, 20, 86)
+)
+
+
+# Calculate Mean Difference (MD) and Variance (vi)
+lvedv_df_MD <- escalc(measure = "MD", 
+                     m1i = m1, sd1i = sd1, n1i = n1, 
+                     m2i = m2, sd2i = sd2, n2i = n2, 
+                     data = lvedv_df) |> data.frame()
+
+
+# Calculate Standard Error (sei) from Variance (vi)
+lvedv_df_MD$sei <- sqrt(lvedv_df_MD$vi)
+
+# View the analyzed dataset
+print(lvedv_df_MD[, c("study", "subgroup", "yi", "vi", "sei")])
+```
+
+
+The Bayesian meta-regression random-effect model is:
+
+
+$$
+\begin{align*}
+y_i&\sim Normal(\theta_i, \sigma_i^2)\\
+\theta_i &\sim Normal(\mu, \tau^2) \\
+\mu &= \alpha_{0} + \beta x_i\\
+\\
+Data: \\
+y_i &= \text{study i's mean effect size}  \\
+\sigma_i &= \text{study i's effect size standard error}\\
+x &= \text{binary indicator if study i corresponds to subgroup 0 or 1}
+\\
+\text{Parameters:} \\
+\alpha_0 & = \text{overall effect in subgroup 0} \\
+\beta &= \text{difference between subgroups} \\
+\tau & = \text{between-study heterogeneity} \\
+\\
+\text{Estimands:} \\
+\alpha_0 & = \text{overall effect in subgroup 0} \\
+\alpha_0 + \beta & = \text{overall effect in subgroup 1} \\
+\end{align*}
+$$
+
+Priors (vague)
+
+```{r}
+
+prior_mu_vague_mean_lvedv = 0
+prior_mu_vague_sd_lvedv   = 50
+
+mu_dist_viz(mean   = prior_mu_vague_mean_lvedv, 
+            sd     = prior_mu_vague_sd_lvedv,
+            scale  = "absolute",
+            inner_color = "red",
+            xlabel = "Mean Difference (LVEDV)")
+
+
+```
+
+Beta:subgroup differnce (weakly informative)
+```{r}
+prior_beta_weakly_mean = 0
+prior_beta_weakly_sd = 20
+
+mu_dist_viz(mean = prior_beta_weakly_mean, 
+            sd = prior_beta_weakly_sd,
+            scale = "absolute",
+            xlabel = "Mean Difference",
+            inner_color = "forestgreen")
+```
+
+
+#(Weakly-Informative)
+
+```{r}
+#Heterogeneity Prior (tau) (Weakly-Informative)
+weakly_prior_MD_scale_lvedv = 12
+
+tau_prior_plot(weakly_prior_MD_scale_lvedv)
+```
+
+
+```{r}
+#subgroup
+prior_tau_main_lvedv = function(x) dhalfnormal(x, scale = weakly_prior_MD_scale_lvedv)
+
+lvedv_priors_means_main = c(prior_mu_vague_mean_lvedv, prior_beta_weakly_mean)
+lvedv_priors_sd_main    = c(prior_mu_vague_sd_lvedv, prior_beta_weakly_sd)
+
+
+matrix_lvedv_subgroups = stats::model.matrix(~subgroup, data = lvedv_df_MD)
+# Execute the model
+main_subgroup_lvedv_model = bmr(
+  y      = lvedv_df_MD$yi,            # Mean Difference (ms)
+  sigma  = lvedv_df_MD$sei,           # Standard Error
+  labels = lvedv_df_MD$study,         
+  X      = matrix_lvedv_subgroups,     # Matrix identifying HBP vs LBAP
+  
+  beta.prior.mean = lvedv_priors_means_main,  
+  beta.prior.sd   = lvedv_priors_sd_main,
+  
+  tau.prior = prior_tau_main_lvedv
+)
+
+# Display the numerical results
+summary(main_subgroup_lvedv_model)
+```
+
+
+```{r}
+#Run the Overall Bayesian Meta-Analysis
+
+model_lvedv_primary = bayesmeta(
+  y      = lvedv_df_MD$yi,           # Mean Difference from escalc
+  sigma  = lvedv_df_MD$sei,          # Standard Error from escalc
+  labels = lvedv_df_MD$study,        # Study Names
+  
+  # Applying the synchronized priors
+  mu.prior.mean = prior_mu_vague_mean_lvedv,
+  mu.prior.sd   = prior_mu_vague_sd_lvedv,
+  tau.prior     = prior_tau_main_lvedv
+)
+
+# 5. Review Results
+summary(model_lvedv_primary)
+```
+
+
+```{r}
+#Extract Posterior Samples from SUBGROUP Model 
+
+set.seed(123)
+
+subgroup_samples = 
+  main_subgroup_lvedv_model$rposterior(n = 10000, tau.sample = FALSE) |> 
+  data.frame() |> 
+  reframe(HBP = `X.Intercept.`,
+          LBAP = `X.Intercept.` + subgroupLBAP) # Adjust to your slope name
+
+
+
+# Get the mean and 95% CrI for each subgroup
+subgroupHBP_summary = subgroup_samples$HBP |> mean_hdi()
+
+subgroupLBAP_summary = subgroup_samples$LBAP |> mean_hdi()
+
+posterior_subgroup_lvedv_model = 
+  data.frame(
+    subgroupHBP_mean = subgroupHBP_summary$y,
+    subgroupHBP_upper = subgroupHBP_summary$ymax,
+    subgroupHBP_lower = subgroupHBP_summary$ymin,
+    
+    subgroupLBAP_mean = subgroupLBAP_summary$y,
+    subgroupLBAP_upper = subgroupLBAP_summary$ymax,
+    subgroupLBAP_lower = subgroupLBAP_summary$ymin,
+    
+    tau_median = main_subgroup_lvedv_model$summary["median","tau"],  
+    tau_upper = main_subgroup_lvedv_model$summary["95% upper","tau"],
+    tau_lower = main_subgroup_lvedv_model$summary["95% lower","tau"]
+  ) 
+
+#Extract Posterior Samples from OVERALL Model (model_qrs_primary) -----
+# This ensures the 'Total' diamond matches your primary analysis
+overall_samples = 
+  model_lvedv_primary$rposterior(n = 10000, tau.sample = FALSE) 
+
+prediction_samples = 
+  model_lvedv_primary$rposterior(n = 10000, tau.sample = FALSE, predict = TRUE)
+
+overall_summary_lvedv = overall_samples |> mean_hdi()
+prediction_summary_lvedv = prediction_samples |> mean_hdi()
+```
+
+
+```{r}
+#Create Forest Plot Object 
+
+forest_data_MD = metacont(
+  data = lvedv_df_MD,
+  subgroup = subgroup,   
+  studlab = study,
+  mean.e = lvedv_df_MD$m1, sd.e = sd1, n.e = n1, # CSP
+  mean.c = lvedv_df_MD$m2, sd.c = sd2, n.c = n2,
+  
+  method.tau = "PM",
+  sm = "MD", common = FALSE, random = FALSE
+)
+
+# 4. Add the Overall Bayesian Results 
+m1_lvedv = metaadd(forest_data_MD,
+                 type = "random", text = "Overall Results",
+                 TE = overall_summary_lvedv$y,
+                 lower = overall_summary_lvedv$ymin,
+                 upper = overall_summary_lvedv$ymax)
+
+# Manually insert subgroup-specific results (Subtotals)
+m1_lvedv$TE.random.w = c(posterior_subgroup_lvedv_model$subgroupHBP_mean,
+                       posterior_subgroup_lvedv_model$subgroupLBAP_mean)
+
+m1_lvedv$lower.random.w = c(posterior_subgroup_lvedv_model$subgroupHBP_lower,
+                          posterior_subgroup_lvedv_model$subgroupLBAP_lower)
+
+m1_lvedv$upper.random.w = c(posterior_subgroup_lvedv_model$subgroupHBP_upper,
+                          posterior_subgroup_lvedv_model$subgroupLBAP_upper)
+
+# Name the subtotals
+names(m1_lvedv$TE.random.w) <- names(m1_lvedv$lower.random.w) <- 
+  names(m1_lvedv$upper.random.w) <-  c("HBP", "LBAP")
+
+# Add the Overall Prediction Interval
+m1_lvedv_predict = metaadd(
+  m1_lvedv,
+  type = "prediction",
+  TE = prediction_summary_lvedv$y,
+  upper = prediction_summary_lvedv$ymax,
+  lower = prediction_summary_lvedv$ymin
+)  
+
+# 5. Calculation of Subgroup Probabilities 
+prob_lower_than_0 = main_subgroup_lvedv_model$pposterior(which.beta = 2, beta = 0)
+prob_greater_than_0 = 1 - prob_lower_than_0
+chosen_prob_lvedv = max(prob_lower_than_0, prob_greater_than_0)
+
+subgroup_diff_text = 
+  paste0("Posterior Probability of Subgroup Difference = ", 
+         round(chosen_prob_lvedv, 3)*100, "%")
+
+tau_subgroups_text = 
+  paste0("Heterogeneity (\u03C4) not explained by subgroups = ", 
+         round(posterior_subgroup_lvedv_model$tau_median, 2),
+         " [95% CrI ",
+         round(posterior_subgroup_lvedv_model$tau_lower, 2),
+         ", ",
+         round(posterior_subgroup_lvedv_model$tau_upper, 2), "]")
+
+# 6. Final Plotting 
+forest(m1_lvedv_predict,
+       layout = "RevMan5",
+       sortvar = TE,
+       text.random = "Total (95% CrI)",
+       text.predict = "95% Prediction Interval",
+       text.random.w = "Subtotal (95% CrI)",
+       col.subgroup = "black",
+       print.subgroup.name = FALSE,
+       hetstat = FALSE,
+       test.subgroup = FALSE,
+       
+       text.addline1 = subgroup_diff_text,
+       text.addline2 = tau_subgroups_text,
+       
+       label.e = "CSP", label.c = "BVP",
+       label.left = "Favors CSP", label.right = "Favors BVP",
+       
+       smlab = "Mean Difference (ms)",
+       leftcols = c("studlab", "n.e", "mean.e", "sd.e", "n.c", "mean.c", "sd.c", "effect.ci"),
+       digits.mean = 1, digits.sd = 1, colgap = "3mm")
+```
+
+Probability Plot
+```{r}
+# 1. Extract Posterior Samples 
+# Using your subgroup model and overall model objects
+subgroup_samples_lvedv = 
+  main_subgroup_lvedv_model$rposterior(n = 10000, tau.sample = FALSE) |> 
+  data.frame() |> 
+  reframe(
+    HBP = `X.Intercept.`,                # Intercept = HBP
+    LBAP = `X.Intercept.` + subgroupLBAP # Intercept + Slope = LBAP
+  )
+
+
+# Extract samples for overall model
+overall_samples_lvedv = model_lvedv_primary$rposterior(n = 10000, tau.sample = FALSE)
+
+# Combine into one data frame
+combined_samples_lvedv = subgroup_samples_lvedv |> 
+  mutate(Overall = overall_samples_lvedv)
+
+# 2. Density Plot (Half-Eye) 
+density_plot_lvedv = 
+  combined_samples_lvedv |> 
+  pivot_longer(everything()) |> 
+  mutate(name = factor(name, levels = c("HBP", "LBAP", "Overall"))) |> 
+  ggplot(aes(x = value, fill = name)) +
+  # Shows distribution + Mean + 95% HDI
+  stat_halfeye(.width = 0.95, point_interval = mean_hdi) +
+  scale_fill_manual(values = c("#BE6376", "#EECE9C", "#605A91")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") + # Reference is 0ms
+  scale_x_continuous(breaks = seq(-30, 2, 5)) +
+  coord_cartesian(xlim = c(-25, 10)) +
+  labs(x = "\nMean Difference in LVEDV", y = "") +
+  facet_wrap(~name, ncol = 1) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        legend.position = "none",
+        strip.text.x = element_text(size = 14, face = "bold"),
+        panel.grid.minor = element_blank())
+
+# 3. ECDF (Cumulative Probability) Plot 
+probability_plot_lvedv = 
+  combined_samples_lvedv |> 
+  pivot_longer(everything()) |> 
+  mutate(name = factor(name, levels = c("HBP", "LBAP", "Overall"))) |> 
+  ggplot(aes(x = value, colour = name)) +
+  geom_line(aes(y = after_stat(y)), stat = 'ecdf', linewidth = 1.2) +
+  scale_color_manual(values = c("#BE6376", "#EECE9C", "#605A91")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(-30, 2, 5)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), name = "Cumulative Probability") +
+  coord_cartesian(xlim = c(-30, 10)) +
+  labs(x = "\nMean Difference in LVEDV") +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_line(color = "gray90", linewidth = 0.3),
+        legend.text = element_text(size = 12),
+        legend.title = element_blank())
+
+# 4. Combine Plots 
+density_plot_lvedv + probability_plot_lvedv
+```
+

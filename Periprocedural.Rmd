@@ -1,0 +1,196 @@
+---
+title: "Periprocedural Complications"
+author: "Omar"
+date: "2026-04-16"
+output: html_document
+---
+
+```{r}
+pacman::p_load(bayesmeta,          # Bayesian Meta-Analysis
+               BayesianPriorsTool, # Priors Building Tool
+               dplyr,              # Data Wrangle
+               tidyr,              # Data Wrangle
+               meta,               # Forest Plot
+               metafor,            # Effect Sizes
+               ggdist,             # Distributions
+               ggplot2,            # Plots
+               patchwork,          # Plots
+               here,
+               readxl,             # Import data
+               gt)  
+
+
+
+# ggplot2 theme
+theme_set(
+  theme(
+    plot.title.position = 'plot',
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(color = "gray80", linewidth = 0.3)
+  )
+)
+```
+
+
+```{r}
+# Consolidate all 6 studies 
+peri_com_data <- data.frame(study = c("Huang, 2022", "Upadhyay, 2019", "Vinther, 2021", 
+            "Pujol-Lopez, 2022", "Vijayaraman, 2023", "Wang, 2022", "Physio-Synch Trial, 2026"),
+  ai = c(0, 1, 1, 1, 3, 1, 10),
+  n1 = c(25, 14, 25, 35, 50, 20, 87),
+  ci = c(0, 3, 1, 1, 10, 1, 7),
+  n2 = c(25, 24, 25, 35, 50, 20, 86)
+)
+
+# View the data
+print(peri_com_data)
+
+peri_com_data_OR <- escalc(
+  measure = "OR",
+  ai = ai, n1i = n1,
+  ci = ci, n2i = n2,
+  slab = study,
+  data = peri_com_data
+) |> 
+  data.frame()
+
+peri_com_data_OR$sei <- sqrt(peri_com_data_OR$vi)
+
+
+peri_com_data_OR
+```
+
+
+```{r}
+#prior
+prior_peri_vague_mean_OR = 0
+prior_peri_vague_sd_OR = 2.7
+
+mu_dist_viz(mean = prior_peri_vague_mean_OR, 
+            sd = prior_peri_vague_sd_OR,
+            scale = "relative",
+            xlabel = "Odds Ratio")
+```
+
+```{r}
+#tau
+informative_peri_tau_prior_OR =
+  TurnerEtAlPrior(outcome = "adverse events",
+                  comparator1 = "non-pharmacological",
+                  comparator2 = "non-pharmacological")
+
+informative_peri_prior_OR_mean = informative_peri_tau_prior_OR$parameters["tau", "mu"]
+
+informative_peri_prior_OR_sd = informative_peri_tau_prior_OR$parameters["tau", "sigma"]
+
+
+tau_dist_viz(dist = "log-normal",
+             meanlog = informative_peri_prior_OR_mean,
+             sdlog = informative_peri_prior_OR_sd)
+```
+
+
+```{r}
+#analysis
+peri_model =
+  bayesmeta(y = peri_com_data_OR$yi, 
+            sigma = peri_com_data_OR$sei, 
+            labels = peri_com_data_OR$study,
+            # Priors
+            mu.prior.mean = prior_peri_vague_mean_OR,   
+            mu.prior.sd = prior_peri_vague_sd_OR,       
+            tau.prior = informative_peri_tau_prior_OR$dprior 
+  )
+```
+
+
+```{r}
+posterior_peri_list = 
+  list(
+    mu_mean = peri_model$summary["mean", "mu"],
+    mu_upper = peri_model$summary["95% upper", "mu"],
+    mu_lower = peri_model$summary["95% lower", "mu"],
+    
+    tau_median = peri_model$summary["median","tau"],  
+    tau_upper = peri_model$summary["95% upper","tau"],
+    tau_lower = peri_model$summary["95% lower","tau"],
+    
+    theta_mean = peri_model$summary["mean", "theta"],
+    theta_upper = peri_model$summary["95% upper", "theta"],
+    theta_lower = peri_model$summary["95% lower", "theta"]
+  )
+
+## Forest plot 
+forest_data_OR_peri = metabin(
+  data = peri_com_data_OR,
+  studlab = study,
+  
+  event.e = ai,  # event.e = events in group 1
+  n.e = n1,     # n.e = total in group 1
+  event.c = ci,  # event.c = events in group 2
+  n.c = n2,     # n.c = total in group 2
+  
+  sm = "OR",
+  method.tau = "PM",
+  
+  # Very important: no frequentist analysis in this plot
+  common = FALSE,
+  random = FALSE
+)
+
+# Add Bayesian overall effect posterior summary
+meta_forest_peri = metaadd(
+  forest_data_OR_peri, # "prepared data" object
+  type = "random",
+  
+  TE = posterior_peri_list$mu_mean,
+  upper = posterior_peri_list$mu_upper,
+  lower = posterior_peri_list$mu_lower
+)  
+
+# Add Bayesian Posterior Predictive Distribution summary
+meta_forest_peri_predict = metaadd(
+  meta_forest_peri, # object from above
+  type = "prediction", # note that now is "prediction"
+  
+  TE = posterior_peri_list$theta_mean,
+  upper = posterior_peri_list$theta_upper,
+  lower = posterior_peri_list$theta_lower
+)  
+
+# Create a sentence to summarize tau posterior results
+tau_OR = 
+  paste0("\u03C4 = ", 
+         round(posterior_peri_list$tau_median, 2),
+         " [95% CrI ",
+         round(posterior_peri_list$tau_lower, 2),
+         ", ",
+         round(posterior_peri_list$tau_upper, 2), "]")
+
+meta::forest(meta_forest_peri_predict,
+             layout = "RevMan5",
+             sortvar = TE,
+             text.random = "Total (95% CrI)",
+             text.predict = "95% Prediction Interval",
+             text.addline1 = tau_OR,
+             smlab = "Odds Ratio (log scale)",
+             leftcols=c("studlab", "event.e", "n.e",
+                        "event.c", "n.c", "effect.ci"),
+             leftlabs=c("Study",  NA, NA, NA, NA, "OR"),
+             
+             pooled.events = TRUE,
+             label.e = "CSP", 
+             lab.c = "BVP",
+             label.left = "Favors CSP",
+             label.right = "Favors BVP",
+             colgap = "5mm")
+
+
+```
+
+

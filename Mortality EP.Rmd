@@ -1,0 +1,615 @@
+---
+title: "Mortality"
+author: "Omar Abdullah Gill"
+date: "2026-04-10"
+output: html_document
+---
+Loading of all packages
+```{r}
+pacman::p_load(bayesmeta,          # Bayesian Meta-Analysis
+               BayesianPriorsTool, # Priors Building Tool
+               dplyr,              # Data Wrangle
+               tidyr,              # Data Wrangle
+               meta,               # Forest Plot
+               metafor,            # Effect Sizes
+               ggdist,             # Distributions
+               ggplot2,            # Plots
+               patchwork,          # Plots
+               here,
+               readxl,             # Import data
+               gt)  
+
+# ggplot2 theme
+theme_set(
+  theme(
+    plot.title.position = 'plot',
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(color = "gray80", linewidth = 0.3)
+  )
+)
+```
+Data
+
+```{r}
+# Consolidate all 6 studies 
+mor_data <- data.frame(
+  # Column 1: Study Names
+  study = c("Vinther, 2021 (HBP)", "Wang, 2022 (LBAP)", 
+            "Huang, 2022 (HBP)", "Pujol-Lopez, 2022 (LBAP)", 
+            "Vijayaraman, 2023 (LBAP)", "PhysioSync-HF, 2026 (LBAP)"),
+  
+  # Group info for sorting/labeling (optional but good practice)
+  subgroup = c("HBP", "LBAP", "HBP", "LBAP", "LBAP", "LBAP"),
+  
+  # Data columns: Events / Totals
+  ai = c(0, 0, 1, 0, 2, 11),  # CSP Events
+  n1 = c(25, 20, 25, 35, 50, 87), # CSP Totals
+  ci = c(0, 0, 4, 2, 2, 4),    # BiVP Events
+  n2 = c(25, 20, 25, 35, 50, 86) # BiVP Totals (Correction: BVP total is 86)
+)
+
+
+
+
+# View dataset
+mor_data
+
+
+mor_dat_OR <- escalc(
+  measure = "OR",
+  ai = ai, n1i = n1,
+  ci = ci, n2i = n2,
+  slab = study,
+  data = mor_data
+) |> 
+  data.frame()
+
+mor_dat_OR$sei <- sqrt(mor_dat_OR$vi)
+
+# add subgroup back
+mor_dat_OR$subgroup <- mor_data$subgroup
+
+mor_dat_OR
+```
+
+Prior (vague)
+```{r}
+prior_mor_vague_mean_OR = 0
+prior_mor_vague_sd_OR = 2.7
+
+mu_dist_viz(mean = prior_mor_vague_mean_OR, 
+            sd = prior_mor_vague_sd_OR,
+            scale = "relative",
+            xlabel = "Odds Ratio")
+```
+
+tau
+```{r}
+informative_mor_tau_prior_OR =
+  TurnerEtAlPrior(outcome = "all-cause mortality",
+                  comparator1 = "non-pharmacological",
+                  comparator2 = "non-pharmacological")
+
+informative_mor_prior_OR_mean = informative_mor_tau_prior_OR$parameters["tau", "mu"]
+
+informative_mor_prior_OR_sd = informative_mor_tau_prior_OR$parameters["tau", "sigma"]
+
+
+tau_dist_viz(dist = "log-normal",
+             meanlog = informative_mor_prior_OR_mean,
+             sdlog = informative_mor_prior_OR_sd)
+```
+
+Main_analysis
+```{r,echo=FALSE}
+mor_model =
+  bayesmeta(y = mor_dat_OR$yi, 
+            sigma = mor_dat_OR$sei, 
+            labels = mor_dat_OR$study,
+            # Priors
+            mu.prior.mean = prior_mor_vague_mean_OR,   
+            mu.prior.sd = prior_mor_vague_sd_OR,       
+            tau.prior = informative_mor_tau_prior_OR$dprior 
+  )
+```
+```{r}
+posterior_mor_list = 
+  list(
+    mu_mean = mor_model$summary["mean", "mu"],
+    mu_upper = mor_model$summary["95% upper", "mu"],
+    mu_lower = mor_model$summary["95% lower", "mu"],
+    
+    tau_median = mor_model$summary["median","tau"],  
+    tau_upper = mor_model$summary["95% upper","tau"],
+    tau_lower = mor_model$summary["95% lower","tau"],
+    
+    theta_mean = mor_model$summary["mean", "theta"],
+    theta_upper = mor_model$summary["95% upper", "theta"],
+    theta_lower = mor_model$summary["95% lower", "theta"]
+  )
+
+## Forest plot 
+forest_data_OR_mor = metabin(
+  data = mor_dat_OR,
+  studlab = study,
+  
+  event.e = ai,  # event.e = events in group 1
+  n.e = n1,     # n.e = total in group 1
+  event.c = ci,  # event.c = events in group 2
+  n.c = n2,     # n.c = total in group 2
+  
+  sm = "OR",
+  method.tau = "PM",
+  
+  # Very important: no frequentist analysis in this plot
+  common = FALSE,
+  random = FALSE
+)
+
+# Add Bayesian overall effect posterior summary
+meta_forest_mor = metaadd(
+  forest_data_OR_mor, # "prepared data" object
+  type = "random",
+  
+  TE = posterior_mor_list$mu_mean,
+  upper = posterior_mor_list$mu_upper,
+  lower = posterior_mor_list$mu_lower
+)  
+
+# Add Bayesian Posterior Predictive Distribution summary
+meta_forest_mor_predict = metaadd(
+  meta_forest_mor, # object from above
+  type = "prediction", # note that now is "prediction"
+  
+  TE = posterior_mor_list$theta_mean,
+  upper = posterior_mor_list$theta_upper,
+  lower = posterior_mor_list$theta_lower
+)  
+
+# Create a sentence to summarize tau posterior results
+tau_OR = 
+  paste0("\u03C4 = ", 
+         round(posterior_mor_list$tau_median, 2),
+         " [95% CrI ",
+         round(posterior_mor_list$tau_lower, 2),
+         ", ",
+         round(posterior_mor_list$tau_upper, 2), "]")
+```
+
+Forest plot
+```{r}
+meta::forest(meta_forest_mor_predict,
+             layout = "RevMan5",
+             sortvar = TE,
+             text.random = "Total (95% CrI)",
+             text.predict = "95% Prediction Interval",
+             text.addline1 = tau_OR,
+             smlab = "Odds Ratio (log scale)",
+             leftcols=c("studlab", "event.e", "n.e",
+                        "event.c", "n.c", "effect.ci"),
+             leftlabs=c("Study",  NA, NA, NA, NA, "OR"),
+             
+             pooled.events = TRUE,
+             label.e = "CSP", 
+             lab.c = "BVP",
+             label.left = "Favors CSP",
+             label.right = "Favors BVP",
+             colgap = "5mm")
+```
+
+
+
+Probability plot
+```{r, warning=FALSE, message=FALSE}
+set.seed(123)
+
+posterior_draws <- mor_model$rposterior(n = 10000, tau.sample = FALSE)
+
+mu <- if (is.matrix(posterior_draws) || is.data.frame(posterior_draws)) {
+  posterior_draws[, 1]
+} else {
+  posterior_draws
+}
+
+df <- data.frame(
+  OR = exp(mu)
+)
+
+df <- df[is.finite(df$OR) & df$OR > 0, , drop = FALSE]
+
+
+# 2. PROBABILITY OF BENEFIT
+P_sup <- mean(df$OR < 1)
+
+
+ci <- quantile(df$OR, probs = c(0.025, 0.975))
+
+ci_df <- data.frame(
+  xmin = ci[1],
+  xmax = ci[2],
+  y = 0
+)
+
+mean_or <- mean(df$OR)
+
+mean_df <- data.frame(
+  OR = mean_or,
+  y = 0
+)
+
+#density bar
+dens <- density(df$OR, adjust = 1.2)
+
+dens_df <- data.frame(
+  OR = dens$x,
+  density = dens$y
+)
+
+p_density <- ggplot(dens_df, aes(x = OR, y = density)) +
+  
+  geom_area(fill = "grey85") +
+  
+  geom_area(
+    data = subset(dens_df, OR <= 1),
+    fill = "navy"
+  ) +
+  
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 1) +
+  
+ 
+# CREDIBLE INTERVAL BAR
+
+geom_segment(
+  data = ci_df,
+  aes(x = xmin, xend = xmax, y = y, yend = y),
+  linewidth = 1.5,
+  color = "black"
+) +
+  
+  # mean marker
+  geom_point(
+    data = mean_df,
+    aes(x = OR, y = y),
+    size = 3
+  ) +
+  
+  scale_x_log10() +
+  
+  labs(
+    x = "Odds Ratio (log scale)",
+    y = "Density"
+  ) +
+  
+  annotate(
+    "text",
+    x = ci[1],
+    y = max(dens_df$density) * 0.75,
+    label = paste0(round(P_sup * 100, 1), "%"),
+    fontface = "bold",
+    size = 4
+  ) +
+  
+  theme_classic() +
+  theme(
+    panel.grid.major = element_line(color = "grey85"),
+    panel.grid.minor = element_line(color = "grey92")
+  )
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+#ECDF PLOT
+
+ecdf_fun <- ecdf(df$OR)
+
+x_vals <- exp(seq(
+  log(min(df$OR)),
+  log(max(df$OR)),
+  length.out = 1000
+))
+
+cdf_df <- data.frame(
+  OR = x_vals,
+  cdf = ecdf_fun(x_vals)
+)
+
+p_cdf <- ggplot(cdf_df, aes(x = OR, y = cdf)) +
+  
+  geom_line(linewidth = 1) +
+  
+  geom_area(
+    data = subset(cdf_df, OR <= 1),
+    aes(y = cdf),
+    fill = "navy"
+  ) +
+  
+  geom_vline(xintercept = 1, linetype = "dashed", linewidth = 1) +
+  
+  scale_x_log10() +
+  scale_y_continuous(limits = c(0, 1)) +
+  
+  labs(
+    x = "Odds Ratio",
+    y = "Cumulative Probability"
+  ) +
+  
+  annotate(
+    "text",
+    x = 0.8,
+    y = 0.65,
+    label = paste0(round(P_sup * 100, 1), "%"),
+    fontface = "bold",
+    size = 4
+  ) +
+  
+  theme_classic() +
+  theme(
+    panel.grid.major = element_line(color = "grey85"),
+    panel.grid.minor = element_line(color = "grey92")
+  )
+p_density + p_cdf
+```
+
+
+Meta-regression Analysis with HF etiology
+
+Data
+```{r}
+# Creating the final analysis dataframe
+analysis_df <- data.frame(
+  study = c("Vinther", "Wang", "Pujol-Lopez", "Vijayaraman", "PhysioSync-HF"),
+  # yi = Log Odds Ratio, sei = Standard Error from your previous analysis
+  yi  = c(0.000, 0.000, -1.667, 0.000, 1.087), 
+  sei = c(2.019, 2.024, 1.567, 1.020, 0.605),
+  # Using the ischemic_pct we just calculated
+  ischemic_pct = c(22.0, 0.0, 31.4, 39.0, 12.7)
+)
+
+# Creating the design matrix
+# This allows the model to estimate the Intercept (alpha) and the Slope (beta)
+X_matrix <- model.matrix(~ ischemic_pct, data = analysis_df)
+```
+
+Mian Model for regression (HF)
+```{r}
+# Running the model
+meta_reg_model <- bmr(
+  y      = analysis_df$yi,
+  sigma  = analysis_df$sei,
+  X      = X_matrix,
+  labels = analysis_df$study,
+  
+  # Bayesian Priors
+  beta.prior.mean = c(0, 0),
+  beta.prior.sd   = c(0.82, 1.5),
+  tau.prior       = function(x) dhalfnormal(x, scale = 0.5)
+)
+
+# View the summary output
+summary(meta_reg_model)
+
+
+# Extract posterior samples
+set.seed(123)
+post_samples <- meta_reg_model$rposterior(n = 1000) |> data.frame()
+
+# Probability that increasing Ischemic % favors CSP (Slope < 0)
+prob_csp_favors_ischemic = mean(post_samples$ischemic_pct < 0) * 100
+
+cat("Probability that Etiology favors CSP as Ischemic % increases:", round(prob_csp_favors_ischemic, 1), "%")
+
+# Proportion of the posterior that is negative
+mean(post_samples$ischemic_pct < 0)
+```
+
+
+
+Bayesian random-effects meta-regression demonstrated a negative association between ischemic patient proportion and log odds ratio for mortality (posterior mean β = −0.015, 95% CrI −0.078 to 0.049), suggesting that increasing ischemic burden may shift the mortality benefit toward conduction system pacing (CSP). Clinically, this corresponds to an approximate 14% greater mortality benefit toward CSP for every 10% increase in ischemic patients. However, the 95% credible interval crossed the null, indicating that the evidence remains suggestive rather than conclusive,likely due to the small number of included studies.  The intercept suggested that in predominantly non-ischemic cohorts, outcomes may numerically favor biventricular pacing, supporting the hypothesis that BVP may  be relatively more effective in non-ischemic cardiomyopathy, whereas CSP may confer greater benefit in ischemic populations.
+
+
+```{r}
+set.seed(123)
+
+# posterior draws
+post_samples <- meta_reg_model$rposterior(n = 10000, tau.sample = FALSE) |>
+  data.frame()
+
+# ALPHA (Intercept) = effect when ischemic_pct = 0
+alpha_draws <- post_samples$X.Intercept.
+
+# Probability that BVP is favored in purely non-ischemic patients
+# OR > 1 = favors BVP
+prob_alpha_BVP <- mean(exp(alpha_draws) > 1) * 100
+
+# Probability that CSP is favored in purely non-ischemic patients
+prob_alpha_CSP <- mean(exp(alpha_draws) < 1) * 100
+
+cat(
+  "Probability BVP is favored in purely non-ischemic patients:",
+  round(prob_alpha_BVP, 1), "%\n"
+)
+
+cat(
+  "Probability CSP is favored in purely non-ischemic patients:",
+  round(prob_alpha_CSP, 1), "%\n"
+)
+
+
+# BETA (Slope) = change with increasing ischemic %
+beta_draws <- post_samples$ischemic_pct
+
+# Main hypothesis: more ischemic patients -> CSP benefit increases
+prob_beta_CSP <- mean(beta_draws < 0) * 100
+
+# Opposite direction
+prob_beta_BVP <- mean(beta_draws > 0) * 100
+
+cat(
+  "Probability increasing ischemic burden favors CSP:",
+  round(prob_beta_CSP, 1), "%\n"
+)
+
+cat(
+  "Probability increasing ischemic burden favors BVP:",
+  round(prob_beta_BVP, 1), "%\n"
+)
+
+
+# CLINICALLY MEANINGFUL EFFECT PER 10% INCREASE
+OR_10pct <- exp(beta_draws * 10)
+
+prob_10pct_CSP <- mean(OR_10pct < 1) * 100
+
+cat(
+  "Probability each 10% ischemic increase improves mortality toward CSP:",
+  round(prob_10pct_CSP, 1), "%\n"
+
+)
+```
+
+Table
+```{r}
+# CREATE PUBLICATION-READY GT TABLE
+
+probability_table <- tibble(
+  Parameter = c(
+    "Intercept (α): BVP favored at 0% ischemic",
+    "Intercept (α): CSP favored at 0% ischemic",
+    "Slope (β): Increasing ischemic burden favors CSP",
+    "Slope (β): Increasing ischemic burden favors BVP",
+    "Clinical effect: Every 10% ischemic increase favors CSP"
+  ),
+  
+  `Posterior Probability (%)` = c(
+    round(prob_alpha_BVP, 1),
+    round(prob_alpha_CSP, 1),
+    round(prob_beta_CSP, 1),
+    round(prob_beta_BVP, 1),
+    round(prob_10pct_CSP, 1)
+  ),
+  
+  `Clinical Interpretation` = c(
+    "Probability BVP is superior in purely non-ischemic patients",
+    "Probability CSP is superior in purely non-ischemic patients",
+    "Probability ischemic substrate progressively shifts benefit toward CSP",
+    "Probability ischemic substrate progressively shifts benefit toward BVP",
+    "Probability every 10% rise in ischemic burden improves mortality toward CSP"
+  )
+)
+
+
+# GT TABLE
+probability_table |>
+  gt() |>
+  tab_header(
+    title = md("**Bayesian Meta-Regression: Posterior Probability Summary**"),
+    subtitle = "Clinical interpretation of intercept and etiology slope"
+  ) |>
+  cols_align(
+    align = "center",
+    columns = `Posterior Probability (%)`
+  ) |>
+  cols_width(
+    Parameter ~ px(350),
+    `Posterior Probability (%)` ~ px(180),
+    `Clinical Interpretation` ~ px(500)
+  ) |>
+  fmt_number(
+    columns = `Posterior Probability (%)`,
+    decimals = 1
+  ) |>
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) |>
+  tab_options(
+    table.width = pct(100),
+    heading.title.font.size = px(18),
+    heading.subtitle.font.size = px(13)
+  )
+
+
+
+```
+
+Plot
+
+```{r}
+
+# 1. Data
+plot_df <- analysis_df
+
+# 2. Posterior regression line
+set.seed(123)
+post <- meta_reg_model$rposterior(n = 5000, tau.sample = FALSE) |> 
+  data.frame()
+
+# Create smooth prediction grid
+x_grid <- seq(min(plot_df$ischemic_pct),
+              max(plot_df$ischemic_pct),
+              length.out = 200)
+
+pred_mat <- sapply(x_grid, function(x) {
+  post$X.Intercept. + post$ischemic_pct * x
+})
+
+pred_df <- data.frame(
+  ischemic_pct = x_grid,
+  mean = apply(pred_mat, 2, mean),
+  lower = apply(pred_mat, 2, quantile, 0.025),
+  upper = apply(pred_mat, 2, quantile, 0.975)
+)
+
+# 3. Plot
+ggplot() +
+  
+  # Credible interval band
+  geom_ribbon(
+    data = pred_df,
+    aes(x = ischemic_pct, ymin = lower, ymax = upper),
+    fill = "skyblue",
+    alpha = 0.3
+  ) +
+  
+  # Posterior mean line
+  geom_line(
+    data = pred_df,
+    aes(x = ischemic_pct, y = mean),
+    linewidth = 1.2,
+    color = "blue"
+  ) +
+  
+  # Study points
+  geom_point(
+    data = plot_df,
+    aes(x = ischemic_pct, y = yi),
+    size = 3
+  ) +
+  
+  # Study labels (ANCHORS)
+  geom_text(
+    data = plot_df,
+    aes(x = ischemic_pct, y = yi, label = study),
+    vjust = -1,
+    size = 3
+  ) +
+  
+  # Reference line (no effect)
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  
+  labs(
+    x = "Ischemic Burden (%)",
+    y = "Log Odds Ratio (CSP vs BVP)",
+    title = "Bayesian Meta-Regression: Effect Modification by Ischemic Burden"
+  ) +
+  
+  theme_classic()
+
+
+```
+

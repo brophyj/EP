@@ -1,0 +1,718 @@
+---
+title: "Bayesian Meta-analysis QRS"
+author: "Omar Abdullah Gill"
+date: "10/04/2026"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+We loaded all required packages and libraries
+
+```{r}
+
+pacman::p_load(bayesmeta,          # Bayesian Meta-Analysis
+               BayesianPriorsTool, # Priors Building Tool
+               dplyr,              # Data Wrangle
+               tidyr,              # Data Wrangle
+               meta,               # Forest Plot
+               metafor,            # Effect Sizes
+               ggdist,             # Distributions
+               ggplot2,            # Plots
+               patchwork,          # Plots
+               here,
+               readxl,             # Import data
+               gt)  
+
+# ggplot2 theme
+theme_set(
+  theme(
+    plot.title.position = 'plot',
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(color = "gray80", linewidth = 0.3)
+  )
+)
+```
+
+We input Mean, SD, and N for Conduction System Pacing (CSP) and Biventricular Pacing (BVP). We calculate the Mean Difference (MD) using 'escalc', providing a linear scale in milliseconds (ms) suitable for absolute QRS analysis.
+```{r}
+qrs_data <- data.frame(
+study = c("Huang, 2022", "Lustgarten, 2015", "Upadhyay, 2019", "Vinther, 2021", 
+
+            "Pujol-Lopez, 2022", "Vijayaraman, 2023", "Wang, 2022", "PhysioSync-HF Trial, 2026"),
+subgroup = c("HBP", "HBP", "HBP", "HBP", "LBAP", "LBAP", "LBAP", "LBAP"),
+
+  # CSP (Conduction System Pacing)
+m1 = c(107.7, 145.0, 125.0, 134.0, 125.0, 137.0, 131.5, 122.0),
+sd1 = c(12.5, 24.0, 22.0, 15.0, 18.0, 20.0, 12.5, 25.0),
+n1 = c(50, 21, 16, 25, 35, 50, 20, 87),
+  # BVP (Biventricular Pacing)
+m2 = c(135.7, 165.0, 164.0, 131.0, 129.0, 141.0, 136.6, 126.0),
+sd2 = c(16.6, 17.0, 25.0, 20.0, 13.0, 19.0, 12.9, 21.0),
+n2 = c(50, 21, 24, 25, 35, 50, 20, 86)
+
+)
+# Calculate Mean Difference (MD) and Variance (vi)
+
+dat_MD_qrs <- escalc(measure = "MD", 
+
+                     m1i = m1, sd1i = sd1, n1i = n1, 
+
+                     m2i = m2, sd2i = sd2, n2i = n2, 
+
+                     data = qrs_data) |> 
+data.frame()
+
+# Calculate Standard Error (sei) from Variance (vi)
+dat_MD_qrs$sei <- sqrt(dat_MD_qrs$vi)
+
+# View the analyzed dataset
+print(dat_MD_qrs[, c("study", "subgroup", "yi", "vi", "sei")])
+
+```
+
+Models
+
+## Subgroup model
+
+$$
+\begin{align*}
+y_i&\sim Normal(\theta_i, \sigma_i^2)\\
+\theta_i &\sim Normal(\mu, \tau^2) \\
+\mu &= \alpha_{0} + \beta x_i\\
+\\
+Data: \\
+y_i &= \text{study i's mean effect size}  \\
+\sigma_i &= \text{study i's effect size standard error}\\
+x &= \text{binary indicator if study i corresponds to subgroup 0 or 1}
+\\
+\text{Parameters:} \\
+\alpha_0 & = \text{overall effect in subgroup 0} \\
+\beta &= \text{difference between subgroups} \\
+\tau & = \text{between-study heterogeneity} \\
+\\
+\text{Estimands:} \\
+\alpha_0 & = \text{overall effect in subgroup 0} \\
+\alpha_0 + \beta & = \text{overall effect in subgroup 1} \\
+\end{align*}
+$$
+
+
+
+
+Priors (Vague)
+```{r}
+
+# Mean = 0, SD = 50 (Vague/Broad)
+
+prior_mu_vague_mean_qrs=0
+prior_mu_vague_sd_qrs= 50
+
+mu_dist_viz(mean   = prior_mu_vague_mean_qrs, 
+            sd     = prior_mu_vague_sd_qrs,
+            scale  = "absolute",
+            xlabel = "Mean Difference (QRS Duration)")
+```
+
+Beta: the subgroup difference
+- Weakly-informative prior
+```{r}
+
+#Coefficient Priors (beta) ---
+
+# Intercept (HBP) and Slope (LBAP difference)
+prior_beta_weakly_mean = 0
+prior_beta_weakly_sd = 20
+
+mu_dist_viz(mean = prior_beta_weakly_mean, 
+            sd = prior_beta_weakly_sd,
+            scale = "absolute",
+            xlabel = "Mean Difference (QRS Duration)",
+            inner_color = "forestgreen")
+
+
+```
+#Priors
+
+How we derive informative prior for tau
+
+The prior for between-study heterogeneity (τ) was specified using a weakly informative half-normal distribution. 
+
+To calibrate this prior, we elicited a treatment effect size of 13.34 ms based on the observed range of effects from a previuos meta. Assuming that this value represents the 97.5th percentile of the distribution of true study-level effects, we first converted it to the corresponding heterogeneity scale and then derived the scale parameter of the half-normal prior using a standard two-stage normal calibration approach. 
+
+```{r}
+infor_prior_MD_scale_qrs = 13.34
+tau_prior_plot(infor_prior_MD_scale_qrs)
+prior_infor_tau_main_qrs = function(x) dhalfnormal(x, scale = infor_prior_MD_scale_qrs)
+```
+
+This yielded a prior scale of τ ~ Half-Normal(0, 3.47), which reflects substantial uncertainty while constraining implausibly large between-study heterogeneity.
+
+
+tau (weakly informative)
+```{r}
+weakly_prior_MD_scale_qrs = 20
+tau_prior_plot(weakly_prior_MD_scale_qrs)
+prior_weakly_tau_main_qrs = function(x) dhalfnormal(x, scale = weakly_prior_MD_scale_qrs)
+
+```
+
+
+```{r}
+vague_prior_MD_scale_qrs = 40
+tau_prior_plot(vague_prior_MD_scale_qrs)
+prior_vague_tau_main_qrs = function(x) dhalfnormal(x, scale = vague_prior_MD_scale_qrs)
+```
+
+
+
+# Main primary subgroups analysis 
+
+```{r}
+qrs_priors_means_main = c(prior_mu_vague_mean_qrs, prior_beta_weakly_mean)
+qrs_priors_sd_main    = c(prior_mu_vague_sd_qrs, prior_beta_weakly_sd)
+#subgroups
+dat_MD_qrs$subgroup = factor(dat_MD_qrs$subgroup, 
+                             levels = c("HBP", "LBAP"))
+
+# Create the model matrix for the regression
+# This creates an Intercept (HBP) and a coefficient for LBAP
+matrix_qrs_subgroups = stats::model.matrix(~subgroup, data = dat_MD_qrs)
+# Execute the model
+main_subgroup_qrs_model = bmr(
+
+y      = dat_MD_qrs$yi,            # Mean Difference (ms)
+sigma  = dat_MD_qrs$sei,           # Standard Error
+labels = dat_MD_qrs$study,         
+X      = matrix_qrs_subgroups,     # Matrix identifying HBP vs LBAP
+beta.prior.mean = qrs_priors_means_main,  
+beta.prior.sd   = qrs_priors_sd_main,
+tau.prior = prior_infor_tau_main_qrs
+
+)
+
+```
+
+# Subgroup Sensitivity 
+
+Subgroup (Vague+weakly-informative)
+```{r}
+subgroup_sensitivity_weakly_model = bmr(
+
+y      = dat_MD_qrs$yi,            # Mean Difference (ms)
+sigma  = dat_MD_qrs$sei,           # Standard Error
+labels = dat_MD_qrs$study,         
+X      = matrix_qrs_subgroups,     # Matrix identifying HBP vs LBAP
+beta.prior.mean = qrs_priors_means_main,  
+beta.prior.sd   = qrs_priors_sd_main,
+tau.prior = prior_weakly_tau_main_qrs
+
+)
+
+```
+
+
+Subgroup (Vague+Vague)
+```{r}
+subgroup_sensitivity_vague_model = bmr(
+
+y      = dat_MD_qrs$yi,            # Mean Difference (ms)
+sigma  = dat_MD_qrs$sei,           # Standard Error
+labels = dat_MD_qrs$study,         
+X      = matrix_qrs_subgroups,     # Matrix identifying HBP vs LBAP
+beta.prior.mean = qrs_priors_means_main,  
+beta.prior.sd   = qrs_priors_sd_main,
+tau.prior = prior_vague_tau_main_qrs
+
+)
+
+```
+
+Overall Main analysis
+```{r}
+model_qrs_primary = bayesmeta(
+  y      = dat_MD_qrs$yi,           # Mean Difference from escalc
+  sigma  = dat_MD_qrs$sei,          # Standard Error from escalc
+  labels = dat_MD_qrs$study,        # Study Names
+  
+  # Applying the synchronized priors
+  mu.prior.mean = prior_mu_vague_mean_qrs,
+  mu.prior.sd   = prior_mu_vague_sd_qrs,
+  tau.prior     = prior_infor_tau_main_qrs 
+)
+
+# 5. Review Results
+summary(model_qrs_primary)
+```
+
+# Sensitivity Overall
+Overall (Vague + Weakly sensitivity)
+```{r}
+weakly_sensitivity_overall_model = bayesmeta(
+  y      = dat_MD_qrs$yi,           # Mean Difference from escalc
+  sigma  = dat_MD_qrs$sei,          # Standard Error from escalc
+  labels = dat_MD_qrs$study,        # Study Names
+  
+  # Applying the synchronized priors
+  mu.prior.mean = prior_mu_vague_mean_qrs,
+  mu.prior.sd   = prior_mu_vague_sd_qrs,
+  tau.prior     = prior_weakly_tau_main_qrs
+)
+```
+
+
+Overall (Vague+Vague)
+```{r}
+vague_sensitivity_overall_model = bayesmeta(
+  y      = dat_MD_qrs$yi,           # Mean Difference from escalc
+  sigma  = dat_MD_qrs$sei,          # Standard Error from escalc
+  labels = dat_MD_qrs$study,        # Study Names
+  
+  # Applying the synchronized priors
+  mu.prior.mean = prior_mu_vague_mean_qrs,
+  mu.prior.sd   = prior_mu_vague_sd_qrs,
+  tau.prior     = prior_vague_tau_main_qrs 
+)
+```
+
+
+# Results of Bayesian meta-analysis
+
+
+## Primary analysis 
+
+Forest plot
+
+```{r}
+set.seed(123)
+subgroup_samples = 
+  main_subgroup_qrs_model$rposterior(n = 10000, tau.sample = FALSE) |> 
+  data.frame() |> 
+  reframe(HBP = `X.Intercept.`,
+          LBAP = `X.Intercept.` + subgroupLBAP) # Adjust to your slope name
+
+# Get the mean and 95% CrI for each subgroup
+subgroupHBP_summary = subgroup_samples$HBP |> mean_hdi()
+
+subgroupLBAP_summary = subgroup_samples$LBAP |> mean_hdi()
+
+posterior_subgroup_qrs_model = 
+  data.frame(
+    subgroupHBP_mean = subgroupHBP_summary$y,
+    subgroupHBP_upper = subgroupHBP_summary$ymax,
+    subgroupHBP_lower = subgroupHBP_summary$ymin,
+    
+    subgroupLBAP_mean = subgroupLBAP_summary$y,
+    subgroupLBAP_upper = subgroupLBAP_summary$ymax,
+    subgroupLBAP_lower = subgroupLBAP_summary$ymin,
+    
+    tau_median = main_subgroup_qrs_model$summary["median","tau"],  
+    tau_upper = main_subgroup_qrs_model$summary["95% upper","tau"],
+    tau_lower = main_subgroup_qrs_model$summary["95% lower","tau"]
+  ) 
+
+# 2. Extract Posterior Samples from OVERALL Model (model_qrs_primary) -----
+# This ensures the 'Total' diamond matches your primary analysis
+overall_samples = 
+  model_qrs_primary$rposterior(n = 10000, tau.sample = FALSE) 
+
+prediction_samples = 
+  model_qrs_primary$rposterior(n = 10000, tau.sample = FALSE, predict = TRUE)
+
+overall_summary_qrs = overall_samples |> mean_hdi()
+prediction_summary_qrs = prediction_samples |> mean_hdi()
+
+# 3. Create Forest Plot Object 
+forest_data_MD = metacont(
+  data = dat_MD_qrs,
+  subgroup = subgroup,   
+  studlab = study,
+  mean.e = m1, sd.e = sd1, n.e = n1, # CSP
+  mean.c = m2, sd.c = sd2, n.c = n2, # BVP
+  sm = "MD", common = FALSE, random = FALSE
+)
+
+# 4. Add the Overall Bayesian Results 
+m1_qrs = metaadd(forest_data_MD,
+                 type = "random", text = "Overall Results",
+                 TE = overall_summary_qrs$y,
+                 lower = overall_summary_qrs$ymin,
+                 upper = overall_summary_qrs$ymax)
+
+# Manually insert subgroup-specific results (Subtotals)
+m1_qrs$TE.random.w = c(posterior_subgroup_qrs_model$subgroupHBP_mean,
+                       posterior_subgroup_qrs_model$subgroupLBAP_mean)
+
+m1_qrs$lower.random.w = c(posterior_subgroup_qrs_model$subgroupHBP_lower,
+                          posterior_subgroup_qrs_model$subgroupLBAP_lower)
+
+m1_qrs$upper.random.w = c(posterior_subgroup_qrs_model$subgroupHBP_upper,
+                          posterior_subgroup_qrs_model$subgroupLBAP_upper)
+
+# Name the subtotals
+names(m1_qrs$TE.random.w) <- names(m1_qrs$lower.random.w) <- 
+  names(m1_qrs$upper.random.w) <-  c("HBP", "LBAP")
+
+# Add the Overall Prediction Interval
+m1_qrs_predict = metaadd(
+  m1_qrs,
+  type = "prediction",
+  TE = prediction_summary_qrs$y,
+  upper = prediction_summary_qrs$ymax,
+  lower = prediction_summary_qrs$ymin
+)  
+
+# 5. Calculation of Subgroup Probabilities 
+prob_lower_than_0 = main_subgroup_qrs_model$pposterior(which.beta = 2, beta = 0)
+prob_greater_than_0 = 1 - prob_lower_than_0
+chosen_prob_qrs = max(prob_lower_than_0, prob_greater_than_0)
+
+subgroup_diff_text = 
+  paste0("Posterior Probability of Subgroup Difference = ", 
+         round(chosen_prob_qrs, 3)*100, "%")
+
+tau_subgroups_text = 
+  paste0("Heterogeneity (\u03C4) not explained by subgroups = ", 
+         round(posterior_subgroup_qrs_model$tau_median, 2),
+         " [95% CrI ",
+         round(posterior_subgroup_qrs_model$tau_lower, 2),
+         ", ",
+         round(posterior_subgroup_qrs_model$tau_upper, 2), "]")
+
+# 6. Final Plotting 
+forest(m1_qrs_predict,
+       layout = "RevMan5",
+       sortvar = TE,
+       text.random = "Total (95% CrI)",
+       text.predict = "95% Prediction Interval",
+       text.random.w = "Subtotal (95% CrI)",
+       col.subgroup = "black",
+       print.subgroup.name = FALSE,
+       hetstat = FALSE,
+       test.subgroup = FALSE,
+       
+       text.addline1 = subgroup_diff_text,
+       text.addline2 = tau_subgroups_text,
+       
+       lab.e = "CSP", lab.c = "BVP",
+       label.left = "Favors CSP", label.right = "Favors BVP",
+       
+       smlab = "Mean Difference (ms)",
+       leftcols = c("studlab", "n.e", "mean.e", "sd.e", "n.c", "mean.c", "sd.c", "effect.ci"),
+       digits.mean = 1, digits.sd = 1, colgap = "3mm")
+
+
+```
+
+
+Probability plots
+
+We extract posterior samples for subgroups and overall. These will be visualized as half-eye density plots and cumulative probability curves to illustrate uncertainty and probability of treatment effects.
+```{r}
+# Important to set seed to assure reproducibility
+set.seed(123)
+# 1. Extract Posterior Samples 
+# Using your subgroup model and overall model objects
+subgroup_samples_qrs = 
+  main_subgroup_qrs_model$rposterior(n = 10000, tau.sample = FALSE) |> 
+  data.frame() |> 
+  reframe(
+    HBP = `X.Intercept.`,                # Intercept = HBP
+    LBAP = `X.Intercept.` + subgroupLBAP # Intercept + Slope = LBAP
+  )
+# Extract samples for overall model
+overall_samples_qrs = model_qrs_primary$rposterior(n = 10000, tau.sample = FALSE)
+
+# Combine into one data frame
+combined_samples_qrs = subgroup_samples_qrs |> 
+  mutate(Overall = overall_samples_qrs)
+
+# 2. Density Plot (Half-Eye)
+density_plot_qrs = 
+  combined_samples_qrs |> 
+  pivot_longer(everything()) |> 
+  mutate(name = factor(name, levels = c("HBP", "LBAP", "Overall"))) |> 
+  ggplot(aes(x = value, fill = name)) +
+  # Shows distribution + Mean + 95% HDI
+  stat_halfeye(.width = 0.95, point_interval = mean_hdi) +
+  scale_fill_manual(values = c("#BE6376", "#EECE9C", "#605A91")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") + # Reference is 0ms
+  scale_x_continuous(breaks = seq(-40, 20, 10)) +
+  coord_cartesian(xlim = c(-45, 15)) +
+  labs(x = "\nMean Difference in QRS (ms)", y = "") +
+  facet_wrap(~name, ncol = 1) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        legend.position = "none",
+        strip.text.x = element_text(size = 14, face = "bold"),
+        panel.grid.minor = element_blank())
+
+# 3. ECDF (Cumulative Probability) Plot 
+probability_plot_qrs = 
+  combined_samples_qrs |> 
+  pivot_longer(everything()) |> 
+  mutate(name = factor(name, levels = c("HBP", "LBAP", "Overall"))) |> 
+  ggplot(aes(x = value, colour = name)) +
+  geom_line(aes(y = after_stat(y)), stat = 'ecdf', linewidth = 1.2) +
+  scale_color_manual(values = c("#BE6376", "#EECE9C", "#605A91")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(-40, 20, 10)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), name = "Cumulative Probability") +
+  coord_cartesian(xlim = c(-45, 15)) +
+  labs(x = "\nMean Difference in QRS (ms)") +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_line(color = "gray90", linewidth = 0.3),
+        legend.text = element_text(size = 12),
+        legend.title = element_blank())
+
+# 4. Combine Plots 
+density_plot_qrs + probability_plot_qrs
+
+```
+
+Sensitivity Analysis
+```{r}
+set.seed(123)
+# POSTERIOR: MAIN MODEL
+subgroup_samples_main =
+  main_subgroup_qrs_model$rposterior(n = 10000, tau.sample = FALSE) |>
+  data.frame() |>
+  reframe(
+    HBP = `X.Intercept.`,
+    LBAP = `X.Intercept.` + subgroupLBAP
+  )
+
+subgroupHBP_main = subgroup_samples_main$HBP |> mean_hdi()
+subgroupLBAP_main = subgroup_samples_main$LBAP |> mean_hdi()
+
+posterior_main =
+  data.frame(
+    HBP_mean = subgroupHBP_main$y,
+    HBP_lower = subgroupHBP_main$ymin,
+    HBP_upper = subgroupHBP_main$ymax,
+    
+    LBAP_mean = subgroupLBAP_main$y,
+    LBAP_lower = subgroupLBAP_main$ymin,
+    LBAP_upper = subgroupLBAP_main$ymax
+  )
+
+
+# POSTERIOR: SENSITIVITY MODEL (Weakly)
+subgroup_samples_sens =
+  subgroup_sensitivity_weakly_model$rposterior(n = 10000, tau.sample = FALSE) |>
+  data.frame() |>
+  reframe(
+    HBP = `X.Intercept.`,
+    LBAP = `X.Intercept.` + subgroupLBAP
+  )
+
+subgroupHBP_sens = subgroup_samples_sens$HBP |> mean_hdi()
+subgroupLBAP_sens = subgroup_samples_sens$LBAP |> mean_hdi()
+
+posterior_sens_weak =
+  data.frame(
+    HBP_mean = subgroupHBP_sens$y,
+    HBP_lower = subgroupHBP_sens$ymin,
+    HBP_upper = subgroupHBP_sens$ymax,
+    
+    LBAP_mean = subgroupLBAP_sens$y,
+    LBAP_lower = subgroupLBAP_sens$ymin,
+    LBAP_upper = subgroupLBAP_sens$ymax
+  )
+
+# POSTERIOR: SENSITIVITY MODEL (Vague)
+subgroup_samples_sens =
+  subgroup_sensitivity_vague_model$rposterior(n = 10000, tau.sample = FALSE) |>
+  data.frame() |>
+  reframe(
+    HBP = `X.Intercept.`,
+    LBAP = `X.Intercept.` + subgroupLBAP
+  )
+
+subgroupHBP_sens = subgroup_samples_sens$HBP |> mean_hdi()
+subgroupLBAP_sens = subgroup_samples_sens$LBAP |> mean_hdi()
+
+posterior_sens_vague =
+  data.frame(
+    HBP_mean = subgroupHBP_sens$y,
+    HBP_lower = subgroupHBP_sens$ymin,
+    HBP_upper = subgroupHBP_sens$ymax,
+    
+    LBAP_mean = subgroupLBAP_sens$y,
+    LBAP_lower = subgroupLBAP_sens$ymin,
+    LBAP_upper = subgroupLBAP_sens$ymax
+  )
+```
+
+Plot
+```{r}
+# FOREST DATA
+forest_data_MD =
+  metacont(
+    data = dat_MD_qrs,
+    studlab = study,
+    
+    mean.e = m1, sd.e = sd1, n.e = n1,
+    mean.c = m2, sd.c = sd2, n.c = n2,
+    
+    sm = "MD",
+    common = FALSE,
+    random = FALSE
+  )
+```
+
+HBP
+```{r}
+# HBP (3 MODELS)
+HBP_primary =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = posterior_main$HBP_mean,
+    lower = posterior_main$HBP_lower,
+    upper = posterior_main$HBP_upper
+  )
+
+HBP_sensitivity_weak =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = posterior_sens_weak$HBP_mean,
+    lower = posterior_sens_weak$HBP_lower,
+    upper = posterior_sens_weak$HBP_upper
+  )
+
+HBP_sensitivity_vague =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = posterior_sens_vague$HBP_mean,
+    lower = posterior_sens_vague$HBP_lower,
+    upper = posterior_sens_vague$HBP_upper
+  )
+
+analyses = c("Primary analysis: Informative prior for tau",
+             "Sensitivity analysis: Weakly-Informative prior for tau",
+             "Sensitivity analysis: Vague prior for tau")
+
+all_HBP =
+  metabind(
+    HBP_primary,
+    HBP_sensitivity_weak,
+    HBP_sensitivity_vague,
+    name = analyses)
+
+forest(all_HBP,
+      smlab = "HBP Subgroup",
+      leftcols = "studlab")
+```
+
+LBAP
+```{r}
+# LBAP (3 MODELS)
+LBAP_primary =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = posterior_main$LBAP_mean,
+    lower = posterior_main$LBAP_lower,
+    upper = posterior_main$LBAP_upper
+  )
+LBAP_sensitivity_weak =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = posterior_sens_weak$LBAP_mean,
+    lower = posterior_sens_weak$LBAP_lower,
+    upper = posterior_sens_weak$LBAP_upper
+  )
+
+LBAP_sensitivity_vague =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = posterior_sens_vague$LBAP_mean,
+    lower = posterior_sens_vague$LBAP_lower,
+    upper = posterior_sens_vague$LBAP_upper
+  )
+
+
+analyses = c("Primary analysis: Informative prior for tau",
+             "Sensitivity analysis: Weakly-Informative prior for tau",
+             "Sensitivity analysis: Vague prior for tau")
+all_LBAP =
+  metabind(
+    LBAP_primary,
+    LBAP_sensitivity_weak,
+    LBAP_sensitivity_vague,
+    name = analyses
+  )
+forest(all_LBAP,
+       smlab = "LBAP Subgroup",
+       leftcols = "studlab")
+```
+
+Overall
+```{r}
+
+overall_samples <- model_qrs_primary$rposterior(n = 10000, tau.sample = FALSE)
+
+overall_summary <- mean_hdi(overall_samples)
+
+overall_samples_sens_weak =
+  weakly_sensitivity_overall_model$rposterior(n = 10000, tau.sample = FALSE) |>
+  mean_hdi()
+
+overall_samples_sens_vague =
+  vague_sensitivity_overall_model$rposterior(n = 10000, tau.sample = FALSE) |>
+  mean_hdi()
+
+overall_primary =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = overall_summary_qrs$y,
+    lower = overall_summary_qrs$ymin,
+    upper = overall_summary_qrs$ymax
+  )
+
+overall_sensitivity_weak =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = overall_samples_sens_weak$y,
+    lower = overall_samples_sens_weak$ymin,
+    upper = overall_samples_sens_weak$ymax
+  )
+
+overall_sensitivity_vague =
+  metaadd(
+    forest_data_MD,
+    type = "random",
+    TE = overall_samples_sens_vague$y,
+    lower = overall_samples_sens_vague$ymin,
+    upper = overall_samples_sens_vague$ymax
+  )
+
+analyses = c("Primary analysis: Informative prior for tau",
+             "Sensitivity analysis: Weakly-Informative prior for tau", "Sensitivity analysis: Vague prior for tau")
+
+all_overall =
+  metabind(
+    overall_primary,
+    overall_sensitivity_weak,
+    overall_sensitivity_vague,
+    name = analyses)
+
+forest(all_overall,
+       smlab = "Overall",
+       leftcols = "studlab")
+```

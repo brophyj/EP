@@ -1,0 +1,441 @@
+---
+title: "LVEF"
+author: "Omar Abdullah Gill"
+date: "2026-04-07"
+output: html_document
+---
+```{r}
+pacman::p_load(bayesmeta,          # Bayesian Meta-Analysis
+               BayesianPriorsTool, # Priors Building Tool
+               dplyr,              # Data Wrangle
+               tidyr,              # Data Wrangle
+               meta,               # Forest Plot
+               metafor,            # Effect Sizes
+               ggdist,             # Distributions
+               ggplot2,            # Plots
+               patchwork,          # Plots
+               here,
+               readxl,             # Import data
+               gt)  
+
+
+
+# ggplot2 theme
+theme_set(
+  theme(
+    plot.title.position = 'plot',
+    axis.ticks.x = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 14),
+    panel.background = element_blank(),
+    panel.grid.major.x = element_line(color = "gray80", linewidth = 0.3)
+  )
+)
+```
+
+
+```{r}
+# Create the dataset
+lvef_df <- data.frame(
+  subgroup = c(rep("HBP", 4), rep("LBAP", 4)),
+  study = c("Huang, 2022", "Lustgarten, 2015", "Upadhyay, 2019", "Vinther, 2021",
+            "Pujol-Lopez, 2022", "Vijayaraman, 2023", "Wang, 2022", "Physio-Synch Trial, 2026"),
+  # CSP Group Data
+  m1 = c(53.90, 32.00, 36.90, 46.00, 12.20, 42.90, 49.40,35),
+  sd1   = c(11.90, 7.50, 11.50, 9.00, 9.00, 10.10, 13.20, 12),
+  n1    = c(18, 12, 16, 25, 35, 50, 20, 87),
+  # BVP Group Data
+  m2 = c(51.30, 31.00, 34.50, 43.00, 13.10, 39.10, 46.50, 39),
+  sd2   = c(7.40, 5.50, 7.20, 7.00, 9.00, 9.70, 9.40, 12),
+  n2    = c(20, 12, 24, 25, 33, 50, 20, 86)
+)
+
+
+dat_lvef_MD <- escalc(measure = "MD", 
+                     m1i = m1, sd1i = sd1, n1i = n1, 
+                     m2i = m2, sd2i = sd2, n2i = n2, 
+                     data = lvef_df) |> 
+  data.frame()
+
+# Calculate Standard Error (sei) from Variance (vi)
+dat_lvef_MD$sei <- sqrt(dat_lvef_MD$vi)
+
+# View the analyzed dataset
+print(dat_lvef_MD[, c("study", "subgroup", "yi", "vi", "sei")])
+```
+
+
+```{r}
+# 1. Define Priors for Mean Difference (mu)
+# Using your specified vague prior (Mean 0, SD 51)
+prior_mu_vague_mean_lvef = 0
+prior_mu_vague_sd_lvef   = 51
+
+# 2. Define Prior for Heterogeneity (tau)
+# Setting the scale to 12 as per your tau_prior_plot request
+weakly_prior_MD_scale_lvef = 12
+
+# Defining the half-normal function for the bayesmeta call
+prior_tau_weakly_lvef = function(x) dhalfnormal(x, scale = weakly_prior_MD_scale_lvef)
+# 3. Visualization of Priors
+# Visualizing the distribution of the Mean Difference prior
+mu_dist_viz(mean   = prior_mu_vague_mean_lvef, 
+            sd     = prior_mu_vague_sd_lvef,
+            scale  = "absolute",
+            inner_color = "blue", 
+            xlabel = "Mean Difference ( LVEF %)")
+
+
+# Visualizing the Weakly Informative tau prior
+tau_prior_plot(weakly_prior_MD_scale_lvef)
+
+
+# 4. Run the Bayesian Meta-Analysis
+# This links your calculated effect sizes (yi) and standard errors (sei)
+model_lvef_primary = bayesmeta(
+  y      = dat_lvef_MD$yi,           # Mean Difference from escalc
+  sigma  = dat_lvef_MD$sei,          # Standard Error from escalc
+  labels = dat_lvef_MD$study,        # Study Names
+  
+  # Applying the synchronized priors
+  mu.prior.mean = prior_mu_vague_mean_lvef,
+  mu.prior.sd   = prior_mu_vague_sd_lvef,
+  tau.prior     = prior_tau_weakly_lvef
+)
+
+# 5. Review Results
+summary(model_lvef_primary)
+```
+
+#sub-group analysis
+```{r}
+# Ensure subgroup is a factor with HBP as the reference
+dat_lvef_MD$subgroup = factor(dat_lvef_MD$subgroup, 
+                             levels = c("HBP", "LBAP"))
+
+# Create the model matrix for the regression
+# This creates an Intercept (HBP) and a coefficient for LBAP
+matrix_qrs_subgroups = stats::model.matrix(~subgroup, data = dat_lvef_MD)
+
+
+
+# Priors for the coefficients (Beta)
+# Index 1: Intercept (HBP Mean Difference)
+# Index 2: Slope (Difference between LBAP and HBP)
+prior_beta_weakly_mean_lvef = 0
+prior_beta_weakly_sd_lvef = 12 # Weakly informative for the difference in ms
+
+
+lvef_priors_means = c(prior_mu_vague_mean_lvef, prior_beta_weakly_mean_lvef)
+lvef_priors_sd    = c(prior_mu_vague_sd_lvef,   prior_beta_weakly_sd_lvef)
+
+
+#main analysis
+
+subgroup_lvef_model = bmr(
+  y      = dat_lvef_MD$yi,            # Mean Difference (ms)
+  sigma  = dat_lvef_MD$sei,           # Standard Error
+  labels = dat_lvef_MD$study,         # Study names (e.g., Huang, 2022)
+  X      = matrix_qrs_subgroups,     # Subgroup matrix (HBP vs LBAP)
+  
+  # Applying the synchronized priors
+  beta.prior.mean = lvef_priors_means, 
+  beta.prior.sd   = lvef_priors_sd,
+  
+  # Using the Informative tau prior (scale = 4) for the primary subgroup model
+  tau.prior = prior_tau_weakly_lvef 
+)
+
+# View results
+summary(subgroup_lvef_model)
+```
+
+
+```{r}
+# 1. Extract Posterior Samples from SUBGROUP Model (for Subtotals) --------
+set.seed(123)
+
+subgroup_samples = 
+  subgroup_lvef_model$rposterior(n = 10000, tau.sample = FALSE) |> 
+  data.frame() |> 
+  reframe(HBP = `X.Intercept.`,
+          LBAP = `X.Intercept.` + subgroupLBAP) # Adjust to your slope name
+
+# Get the mean and 95% CrI for each subgroup
+subgroupHBP_summary = subgroup_samples$HBP |> mean_hdi()
+subgroupLBAP_summary = subgroup_samples$LBAP |> mean_hdi()
+
+posterior_subgroup_lvef_model = 
+  data.frame(
+    subgroupHBP_mean = subgroupHBP_summary$y,
+    subgroupHBP_upper = subgroupHBP_summary$ymax,
+    subgroupHBP_lower = subgroupHBP_summary$ymin,
+    
+    subgroupLBAP_mean = subgroupLBAP_summary$y,
+    subgroupLBAP_upper = subgroupLBAP_summary$ymax,
+    subgroupLBAP_lower = subgroupLBAP_summary$ymin,
+    
+    tau_median = subgroup_lvef_model$summary["median","tau"],  
+    tau_upper = subgroup_lvef_model$summary["95% upper","tau"],
+    tau_lower = subgroup_lvef_model$summary["95% lower","tau"]
+  ) 
+
+# 2. Extract Posterior Samples from OVERALL Model (model_qrs_primary) -----
+# This ensures the 'Total' diamond matches your primary analysis
+overall_samples = 
+  model_lvef_primary$rposterior(n = 10000, tau.sample = FALSE) 
+
+prediction_samples = 
+  model_lvef_primary$rposterior(n = 10000, tau.sample = FALSE, predict = TRUE)
+
+overall_summary_lvef = overall_samples |> mean_hdi()
+prediction_summary_lvef = prediction_samples |> mean_hdi()
+
+
+# 3. Create Forest Plot Object --------------------------------------------
+forest_data_MD = metacont(
+  data = dat_lvef_MD,
+  subgroup = subgroup,   
+  studlab = study,
+  mean.e = m1, sd.e = sd1, n.e = n1, # CSP
+  mean.c = m2, sd.c = sd2, n.c = n2, # BVP
+  sm = "MD", common = FALSE, random = FALSE
+)
+
+# 4. Add the Overall Bayesian Results -------------------------------------
+m1_lvef = metaadd(forest_data_MD,
+                 type = "random", text = "Overall Results",
+                 TE = overall_summary_lvef$y,
+                 lower = overall_summary_lvef$ymin,
+                 upper = overall_summary_lvef$ymax)
+
+# Manually insert subgroup-specific results (Subtotals)
+m1_lvef$TE.random.w = c(posterior_subgroup_lvef_model$subgroupHBP_mean,
+                       posterior_subgroup_lvef_model$subgroupLBAP_mean)
+
+m1_lvef$lower.random.w = c(posterior_subgroup_lvef_model$subgroupHBP_lower,
+                          posterior_subgroup_lvef_model$subgroupLBAP_lower)
+
+m1_lvef$upper.random.w = c(posterior_subgroup_lvef_model$subgroupHBP_upper,
+                          posterior_subgroup_lvef_model$subgroupLBAP_upper)
+
+# Name the subtotals
+names(m1_lvef$TE.random.w) <- names(m1_lvef$lower.random.w) <- 
+  names(m1_lvef$upper.random.w) <-  c("HBP", "LBAP")
+
+# Add the Overall Prediction Interval
+m1_lvef_predict = metaadd(
+  m1_lvef,
+  type = "prediction",
+  TE = prediction_summary_lvef$y,
+  upper = prediction_summary_lvef$ymax,
+  lower = prediction_summary_lvef$ymin
+)  
+
+# 5. Calculation of Subgroup Probabilities --------------------------------
+prob_lower_than_0 = subgroup_lvef_model$pposterior(which.beta = 2, beta = 0)
+prob_greater_than_0 = 1 - prob_lower_than_0
+chosen_prob_lvef = max(prob_lower_than_0, prob_greater_than_0)
+
+subgroup_diff_text = 
+  paste0("Posterior Probability of Subgroup Difference = ", 
+         round(chosen_prob_lvef, 3)*100, "%")
+
+tau_subgroups_text = 
+  paste0("Heterogeneity (\u03C4) not explained by subgroups = ", 
+         round(posterior_subgroup_lvef_model$tau_median, 2),
+         " [95% CrI ",
+         round(posterior_subgroup_lvef_model$tau_lower, 2),
+         ", ",
+         round(posterior_subgroup_lvef_model$tau_upper, 2), "]")
+
+# 6. Final Plotting -------------------------------------------------------
+forest(m1_lvef_predict,
+       layout = "RevMan5",
+       sortvar = TE,
+       text.random = "Total (95% CrI)",
+       text.predict = "95% Prediction Interval",
+       text.random.w = "Subtotal (95% CrI)",
+       col.subgroup = "black",
+       print.subgroup.name = FALSE,
+       hetstat = FALSE,
+       test.subgroup = FALSE,
+       
+       text.addline1 = subgroup_diff_text,
+       text.addline2 = tau_subgroups_text,
+       
+       label.e = "CSP", lab.c = "BVP",
+       label.left = "Favors BVP", label.right = "Favors CSP",
+       
+       smlab = "Mean Difference (ms)",
+       leftcols = c("studlab", "n.e", "mean.e", "sd.e", "n.c", "mean.c", "sd.c", "effect.ci"),
+       digits.mean = 1, digits.sd = 1, colgap = "3mm")
+```
+
+
+```{r}
+set.seed(123)
+
+# 1. Extract Posterior Samples --------------------------------------------
+# Using your subgroup model and overall model objects
+subgroup_samples_lvef = 
+  subgroup_lvef_model$rposterior(n = 10000, tau.sample = FALSE) |> 
+  data.frame() |> 
+  reframe(
+    HBP = `X.Intercept.`,                # Intercept = HBP
+    LBAP = `X.Intercept.` + subgroupLBAP # Intercept + Slope = LBAP
+  )
+
+
+# Extract samples for overall model
+overall_samples_lvef = model_lvef_primary$rposterior(n = 10000, tau.sample = FALSE)
+
+# Combine into one data frame
+combined_samples_lvef = subgroup_samples_lvef |> 
+  mutate(Overall = overall_samples_lvef)
+
+# 2. Density Plot (Half-Eye) ----------------------------------------------
+adensity_plot_lvef = 
+  combined_samples_lvef |> 
+  pivot_longer(everything()) |> 
+  mutate(name = factor(name, levels = c("HBP", "LBAP", "Overall"))) |> 
+  ggplot(aes(x = value, fill = name)) +
+  # Shows distribution + Mean + 95% HDI
+  stat_halfeye(.width = 0.95, point_interval = mean_hdi) +
+  scale_fill_manual(values = c("#BE6376", "#EECE9C", "#605A91")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") + # Reference is 0ms
+  scale_x_continuous(breaks = seq(-7, 20, 7)) +
+  coord_cartesian(xlim = c(-10, 10)) +
+  labs(x = "\nMean Difference in LVEF (%)", y = "") +
+  facet_wrap(~name, ncol = 1) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        legend.position = "none",
+        strip.text.x = element_text(size = 14, face = "bold"),
+        panel.grid.minor = element_blank())
+
+# 3. ECDF (Cumulative Probability) Plot -----------------------------------
+aprobability_plot_lvef = 
+  combined_samples_lvef |> 
+  pivot_longer(everything()) |> 
+  mutate(name = factor(name, levels = c("HBP", "LBAP", "Overall"))) |> 
+  ggplot(aes(x = value, colour = name)) +
+  geom_line(aes(y = after_stat(y)), stat = 'ecdf', linewidth = 1.2) +
+  scale_color_manual(values = c("#BE6376", "#EECE9C", "#605A91")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_continuous(breaks = seq(-7, 20, 7)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), name = "Cumulative Probability") +
+  coord_cartesian(xlim = c(-10, 10)) +
+  labs(x = "\nMean Difference in LVEF (%)") +
+  theme_minimal() +
+  theme(panel.grid.major.y = element_line(color = "gray90", linewidth = 0.3),
+        legend.text = element_text(size = 12),
+        legend.title = element_blank())
+
+# 4. Combine Plots --------------------------------------------------------
+adensity_plot_lvef + aprobability_plot_lvef
+```
+
+
+```{r}
+
+# --- LVEF POSTERIOR SUMMARY TABLE ---
+
+# 1. Calculation & Extraction
+# We use mean_hdi to get the Bayesian point estimate and 95% Credible Interval
+lvef_hdi_summary <- mean_hdi(overall_samples, .width = 0.95)
+
+# 2. Probability of Benefit
+# P(Mean Difference > 0)
+prob_benefit_lvef <- (1 - model_lvef_primary$pposterior(mu = 0)) * 100
+
+# 3. Create the Tibble
+lvef_viewer_df <- tibble(
+  Outcome = "Left Ventricular Ejection Fraction (LVEF)",
+  `Effect Size` = "Mean Difference (%)",
+  mu_mean = lvef_hdi_summary$y,
+  mu_lower = lvef_hdi_summary$ymin,
+  mu_upper = lvef_hdi_summary$ymax,
+  `Probability of Benefit (%)` = round(prob_benefit_lvef, 1)
+) |> 
+  mutate(`Mean [95% Credible Interval]` = paste0(
+    round(mu_mean, 1), " [", 
+    round(mu_lower, 1), ", ", 
+    round(mu_upper, 1), "]"
+  ))
+
+# 4. Generate the GT Table for the Viewer
+lvef_viewer_df |> 
+  select(Outcome, `Effect Size`, `Mean [95% Credible Interval]`, `Probability of Benefit (%)`) |> 
+  gt() |> 
+  # --- Styling ---
+  tab_header(
+    title = md("**Bayesian Posterior Summary: LVEF Analysis**"),
+    subtitle = "Primary Analysis using Vague Mu and Weakly Informative Tau Priors"
+  ) |> 
+  cols_align(align = "center", columns = everything()) |> 
+  cols_label(
+    `Probability of Benefit (%)` = md("**Probability of Benefit (%)**")
+  ) |> 
+  tab_options(
+    table.width = px(600),
+    column_labels.font.weight = "bold",
+    heading.title.font.size = px(18)
+  ) |> 
+  tab_footnote(
+    footnote = "Posterior Probability that Mean Difference > 0 (Favors CSP over BVP).",
+    locations = cells_column_labels(columns = `Probability of Benefit (%)`)
+  ) |> 
+  tab_footnote(
+    footnote = "95% Credible Interval represents the Highest Density Interval (HDI).",
+    locations = cells_column_labels(columns = `Mean [95% Credible Interval]`)
+  )
+
+```
+
+
+```{r}
+# 1. Parameter Definitions
+prior_mu_vague_mean_lvef = 0
+prior_mu_vague_sd_lvef   = 51
+weakly_prior_MD_scale_lvef = 12
+
+# 2. Build the Prior Summary Tibble
+lvef_prior_summary <- tibble(
+  Outcome = "LVEF",
+  `Effect Size` = "Mean Difference (%)",
+  `Prior Type for Mu` = "Vague",
+  mu_mean = prior_mu_vague_mean_lvef,
+  mu_sd = prior_mu_vague_sd_lvef,
+  `Prior Type for Tau` = "Weakly-informative",
+  tau_mean = 0,
+  tau_sd = weakly_prior_MD_scale_lvef
+) |> 
+  mutate(
+    `Mu Prior Distribution` = paste0("Normal(", mu_mean, ", ", mu_sd, ")"),
+    `Tau Prior Distribution` = paste0("Half-Normal(", tau_sd, ")")
+  )
+
+# 3. Create the GT Table
+lvef_prior_summary |> 
+  select(Outcome, `Effect Size`, `Prior Type for Mu`, `Mu Prior Distribution`, 
+         `Prior Type for Tau`, `Tau Prior Distribution`) |> 
+  gt() |> 
+  tab_header(title = "Bayesian Prior Specifications for LVEF Analysis") |> 
+  tab_footnote(
+    footnote = "Mu represents the overall pooled effect (Mean Difference).",
+    locations = cells_column_labels(columns = `Mu Prior Distribution`)
+  ) |> 
+  tab_footnote(
+    footnote = "Tau represents between-study heterogeneity. Half-Normal is truncated at 0.",
+    locations = cells_column_labels(columns = `Tau Prior Distribution`)
+  )
+
+
+
+
+```
+
+
