@@ -1,0 +1,497 @@
+---
+title: "Mortality EP workflow audit"
+subtitle: "Companion analysis for `Mortality EP.Rmd`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  freeze: auto
+---
+
+## Scope and intent
+
+This companion document audits the workflow in `Mortality EP.Rmd` without editing the source file.  
+Goals:
+
+1. preserve the same mortality endpoint framing (CSP vs BVP),
+2. make Bayesian assumptions explicit,
+3. use clinically grounded priors on pooled log-OR (`mu`),
+4. evaluate prior sensitivity,
+5. add posterior predictive checks (PPC),
+6. report uncertainty-calibrated interpretation language, and
+7. cross-check the core random-effects result with a `brms` front-end using `cmdstanr`.
+
+## Setup and package checks
+
+```{r}
+# Core stack used in this audit
+core_pkgs <- c(
+  "bayesmeta",
+  "metafor",
+  "dplyr",
+  "tibble",
+  "tidyr",
+  "purrr",
+  "ggplot2",
+  "knitr"
+)
+
+missing_core <- core_pkgs[!vapply(core_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+analysis_ok <- length(missing_core) == 0
+
+if (analysis_ok) {
+  invisible(lapply(core_pkgs, library, character.only = TRUE))
+  set.seed(20260418)
+  theme_set(theme_minimal(base_size = 12))
+} else {
+  cat(
+    "Core packages missing:", paste(missing_core, collapse = ", "),
+    "\nSections requiring these packages are skipped."
+  )
+}
+
+turner_ok <- requireNamespace("BayesianPriorsTool", quietly = TRUE)
+brms_ok <- requireNamespace("brms", quietly = TRUE) && requireNamespace("cmdstanr", quietly = TRUE)
+
+cmdstan_available <- FALSE
+if (brms_ok) {
+  cmdstan_available <- tryCatch({
+    p <- cmdstanr::cmdstan_path()
+    !is.null(p) && nzchar(p)
+  }, error = function(e) FALSE)
+}
+```
+
+## Data reconstruction and effect-size derivation
+
+```{r, eval=analysis_ok}
+# Reconstructed from Mortality EP.Rmd
+mor_data <- tibble::tibble(
+  study = c(
+    "Vinther, 2021 (HBP)",
+    "Wang, 2022 (LBAP)",
+    "Huang, 2022 (HBP)",
+    "Pujol-Lopez, 2022 (LBAP)",
+    "Vijayaraman, 2023 (LBAP)",
+    "PhysioSync-HF, 2026 (LBAP)"
+  ),
+  subgroup = c("HBP", "LBAP", "HBP", "LBAP", "LBAP", "LBAP"),
+  ai = c(0, 0, 1, 0, 2, 11),  # CSP events
+  n1 = c(25, 20, 25, 35, 50, 87),
+  ci = c(0, 0, 4, 2, 2, 4),   # BVP events
+  n2 = c(25, 20, 25, 35, 50, 86)
+)
+
+# Log-OR and its sampling variance via metafor::escalc.
+# add=0.5, to="only0": continuity correction only where needed for zero-event cells.
+mor_es <- metafor::escalc(
+  measure = "OR",
+  ai = ai, n1i = n1,
+  ci = ci, n2i = n2,
+  data = mor_data,
+  slab = study,
+  add = 0.5,
+  to = "only0"
+) |>
+  as.data.frame() |>
+  dplyr::mutate(sei = sqrt(vi))
+
+knitr::kable(
+  mor_es |>
+    dplyr::select(study, ai, n1, ci, n2, yi, sei) |>
+    dplyr::mutate(
+      yi = round(yi, 3),
+      sei = round(sei, 3)
+    ),
+  caption = "Study-level mortality effects (log-OR scale)."
+)
+```
+
+## Audit notes on the original workflow
+
+1. The original analysis uses an appropriate random-effects Bayesian synthesis (`bayesmeta`) for sparse-event data.
+2. Multiple studies have zero events in one or both arms; this can heavily influence log-OR approximation via continuity corrections.
+3. The normal-normal hierarchy is practical for transparent Bayesian synthesis, but approximation error can rise with very sparse binary outcomes.
+4. A companion analysis should therefore stress-test priors, inspect posterior predictive behavior, and calibrate interpretation to probability magnitudes rather than dichotomous claims.
+
+## Clinically grounded priors for pooled log-OR (`mu`)
+
+The pooled effect is on the log-OR scale (`mu`).  
+Clinical intuition for pacing strategy comparisons generally expects modest mortality shifts, not extreme (>2x) effects across broad HF populations. We therefore define a prior set spanning skeptical to mildly CSP-favoring beliefs.
+
+```{r, eval=analysis_ok}
+mu_priors <- tibble::tribble(
+  ~prior_id, ~clinical_label, ~mu_mean, ~mu_sd,
+  "skeptical", "Skeptical/no large mortality shift expected", 0.00, 0.20,
+  "weakly_informative", "Allows moderate benefit/harm while ruling out implausible extremes", 0.00, 0.35,
+  "mild_csp_favoring", "Mild pre-trial expectation for CSP benefit", log(0.90), 0.30
+) |>
+  dplyr::mutate(
+    prior_or_median = exp(mu_mean),
+    prior_or_low95 = exp(mu_mean - 1.96 * mu_sd),
+    prior_or_high95 = exp(mu_mean + 1.96 * mu_sd)
+  )
+
+knitr::kable(
+  mu_priors |>
+    dplyr::transmute(
+      prior_id,
+      clinical_label,
+      mu_mean = round(mu_mean, 3),
+      mu_sd = round(mu_sd, 3),
+      prior_or_median = round(prior_or_median, 3),
+      prior_or_low95 = round(prior_or_low95, 3),
+      prior_or_high95 = round(prior_or_high95, 3)
+    ),
+  caption = "Clinically grounded priors for pooled log-OR."
+)
+```
+
+## Heterogeneity prior (`tau`) and rationale
+
+```{r, eval=analysis_ok}
+tau_prior_label <- NULL
+tau_prior_fun <- NULL
+
+if (turner_ok) {
+  turner_prior <- BayesianPriorsTool::TurnerEtAlPrior(
+    outcome = "all-cause mortality",
+    comparator1 = "non-pharmacological",
+    comparator2 = "non-pharmacological"
+  )
+  tau_prior_fun <- turner_prior$dprior
+  tau_prior_label <- "Turner et al. empiric log-normal heterogeneity prior"
+} else {
+  # Conservative fallback if BayesianPriorsTool is unavailable.
+  tau_prior_fun <- function(x) bayesmeta::dhalfnormal(x, scale = 0.5)
+  tau_prior_label <- "Fallback half-normal prior: tau ~ half-normal(0, 0.5)"
+}
+
+cat("Tau prior used:", tau_prior_label)
+```
+
+## Reference bayesmeta model (normal-normal hierarchy)
+
+```{r, eval=analysis_ok}
+fit_bayesmeta <- function(mu_mean, mu_sd, tau_prior) {
+  bayesmeta::bayesmeta(
+    y = mor_es$yi,
+    sigma = mor_es$sei,
+    labels = mor_es$study,
+    mu.prior.mean = mu_mean,
+    mu.prior.sd = mu_sd,
+    tau.prior = tau_prior
+  )
+}
+
+extract_draws <- function(fit, n = 20000) {
+  d <- as.data.frame(fit$rposterior(n = n, tau.sample = TRUE))
+  # Defensive naming for compatibility across bayesmeta versions
+  if (!("mu" %in% names(d)) && ncol(d) >= 1) names(d)[1] <- "mu"
+  if (!("tau" %in% names(d)) && ncol(d) >= 2) names(d)[2] <- "tau"
+  d
+}
+
+ref_prior <- mu_priors |>
+  dplyr::filter(prior_id == "weakly_informative")
+
+ref_fit <- fit_bayesmeta(
+  mu_mean = ref_prior$mu_mean,
+  mu_sd = ref_prior$mu_sd,
+  tau_prior = tau_prior_fun
+)
+
+ref_draws <- extract_draws(ref_fit)
+
+ref_summary <- tibble::tibble(
+  metric = c("mu (log-OR)", "OR", "tau"),
+  mean = c(
+    ref_fit$summary["mean", "mu"],
+    exp(ref_fit$summary["mean", "mu"]),
+    ref_fit$summary["mean", "tau"]
+  ),
+  low95 = c(
+    ref_fit$summary["95% lower", "mu"],
+    exp(ref_fit$summary["95% lower", "mu"]),
+    ref_fit$summary["95% lower", "tau"]
+  ),
+  high95 = c(
+    ref_fit$summary["95% upper", "mu"],
+    exp(ref_fit$summary["95% upper", "mu"]),
+    ref_fit$summary["95% upper", "tau"]
+  ),
+  prob_csp_benefit = c(
+    mean(ref_draws$mu < 0),
+    mean(exp(ref_draws$mu) < 1),
+    NA_real_
+  )
+)
+
+knitr::kable(
+  ref_summary |>
+    dplyr::mutate(
+      dplyr::across(c(mean, low95, high95, prob_csp_benefit), ~ round(.x, 3))
+    ),
+  caption = "Reference posterior summary (weakly informative mu prior)."
+)
+```
+
+## Explicit assumptions and limitations of the bayesmeta normal-normal approximation
+
+The model can be written as:
+
+- sampling model: \(y_i \mid \theta_i \sim \mathcal{N}(\theta_i, s_i^2)\),
+- random effects: \(\theta_i \mid \mu, \tau \sim \mathcal{N}(\mu, \tau^2)\).
+
+Key assumptions and practical limitations in this mortality setting:
+
+1. **Approximate normality of log-OR estimates**: with sparse events and zero cells, asymptotic normality may be imperfect.
+2. **Within-study SE treated as known**: uncertainty in `sei` estimation is not propagated.
+3. **Exchangeability**: studies are assumed conditionally exchangeable around one latent mean `mu`.
+4. **Continuity-correction dependence**: zero-cell handling can materially alter `yi` and `sei`.
+5. **Small-\(k\) fragility**: with only six studies, posterior inferences are sensitive to prior choices for `mu` and especially `tau`.
+6. **Marginal (study-level) estimand**: trial-level aggregate OR can obscure patient-level treatment effect heterogeneity.
+
+## Prior sensitivity analysis
+
+```{r, eval=analysis_ok}
+sensitivity_tbl <- mu_priors |>
+  dplyr::mutate(
+    fit = purrr::map2(mu_mean, mu_sd, ~ fit_bayesmeta(.x, .y, tau_prior_fun)),
+    draws = purrr::map(fit, extract_draws),
+    post_mu_mean = purrr::map_dbl(fit, ~ .x$summary["mean", "mu"]),
+    post_mu_low95 = purrr::map_dbl(fit, ~ .x$summary["95% lower", "mu"]),
+    post_mu_high95 = purrr::map_dbl(fit, ~ .x$summary["95% upper", "mu"]),
+    post_or_mean = exp(post_mu_mean),
+    post_or_low95 = exp(post_mu_low95),
+    post_or_high95 = exp(post_mu_high95),
+    pr_or_lt_1 = purrr::map_dbl(draws, ~ mean(exp(.x$mu) < 1)),
+    pr_or_lt_0_9 = purrr::map_dbl(draws, ~ mean(exp(.x$mu) < 0.9)),
+    pr_or_gt_1_1 = purrr::map_dbl(draws, ~ mean(exp(.x$mu) > 1.1))
+  ) |>
+  dplyr::select(
+    prior_id, clinical_label,
+    post_or_mean, post_or_low95, post_or_high95,
+    pr_or_lt_1, pr_or_lt_0_9, pr_or_gt_1_1
+  )
+
+knitr::kable(
+  sensitivity_tbl |>
+    dplyr::mutate(
+      dplyr::across(
+        c(post_or_mean, post_or_low95, post_or_high95, pr_or_lt_1, pr_or_lt_0_9, pr_or_gt_1_1),
+        ~ round(.x, 3)
+      )
+    ),
+  caption = "Posterior sensitivity to alternative clinically grounded mu priors."
+)
+```
+
+```{r, eval=analysis_ok}
+ggplot(
+  sensitivity_tbl,
+  aes(y = prior_id, x = post_or_mean, xmin = post_or_low95, xmax = post_or_high95)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray40") +
+  geom_errorbarh(height = 0.15, linewidth = 0.8, color = "#2b6cb0") +
+  geom_point(size = 2.5, color = "#2b6cb0") +
+  labs(
+    title = "Prior sensitivity of pooled mortality OR",
+    x = "Posterior pooled OR (95% CrI)",
+    y = "mu prior specification"
+  )
+```
+
+## Posterior predictive checks (PPC)
+
+```{r, eval=analysis_ok}
+# Draw posterior predictive replicated effects:
+# theta_i^rep ~ N(mu, tau^2), y_i^rep ~ N(theta_i^rep, sei_i^2)
+draw_idx <- sample.int(n = nrow(ref_draws), size = 3000, replace = TRUE)
+mu_s <- ref_draws$mu[draw_idx]
+tau_s <- pmax(ref_draws$tau[draw_idx], 0)
+
+yrep_mat <- vapply(
+  X = seq_along(mu_s),
+  FUN = function(j) {
+    theta_rep <- rnorm(n = nrow(mor_es), mean = mu_s[j], sd = tau_s[j])
+    rnorm(n = nrow(mor_es), mean = theta_rep, sd = mor_es$sei)
+  },
+  FUN.VALUE = numeric(nrow(mor_es))
+)
+
+obs_mean <- mean(mor_es$yi)
+obs_sd <- stats::sd(mor_es$yi)
+rep_mean <- colMeans(yrep_mat)
+rep_sd <- apply(yrep_mat, 2, stats::sd)
+
+ppc_stats <- tibble::tibble(
+  discrepancy = c("Mean(log-OR)", "SD(log-OR)"),
+  observed = c(obs_mean, obs_sd),
+  ppc_p_value = c(mean(rep_mean >= obs_mean), mean(rep_sd >= obs_sd))
+)
+
+knitr::kable(
+  ppc_stats |> dplyr::mutate(dplyr::across(c(observed, ppc_p_value), ~ round(.x, 3))),
+  caption = "Posterior predictive discrepancy checks (Bayesian p-values near 0.5 are reassuring)."
+)
+```
+
+```{r, eval=analysis_ok}
+ppc_by_study <- tibble::tibble(
+  study = mor_es$study,
+  observed = mor_es$yi,
+  pred_low95 = apply(yrep_mat, 1, stats::quantile, probs = 0.025),
+  pred_med = apply(yrep_mat, 1, stats::quantile, probs = 0.5),
+  pred_high95 = apply(yrep_mat, 1, stats::quantile, probs = 0.975)
+)
+
+ggplot(ppc_by_study, aes(y = reorder(study, observed))) +
+  geom_segment(
+    aes(x = pred_low95, xend = pred_high95, yend = reorder(study, observed)),
+    linewidth = 1.0,
+    color = "gray65"
+  ) +
+  geom_point(aes(x = pred_med), color = "#2b6cb0", size = 2) +
+  geom_point(aes(x = observed), color = "#c53030", size = 2.2) +
+  labs(
+    title = "Study-level PPC intervals for observed log-OR",
+    subtitle = "Red = observed; blue = posterior predictive median; gray = 95% predictive interval",
+    x = "log-OR",
+    y = NULL
+  )
+```
+
+## Uncertainty-calibrated interpretation language
+
+```{r, eval=analysis_ok}
+calibrated_language <- function(probability) {
+  dplyr::case_when(
+    probability < 0.55 ~ "no directional evidence",
+    probability < 0.75 ~ "weak directional signal",
+    probability < 0.90 ~ "moderate directional evidence",
+    probability < 0.975 ~ "strong directional evidence",
+    TRUE ~ "very strong directional evidence"
+  )
+}
+
+p_benefit <- mean(exp(ref_draws$mu) < 1)
+p_meaningful <- mean(exp(ref_draws$mu) < 0.90)   # >=10% relative reduction threshold
+p_harm <- mean(exp(ref_draws$mu) > 1.10)         # >=10% relative increase threshold
+
+interpretation_tbl <- tibble::tibble(
+  quantity = c(
+    "Pr(OR < 1) for CSP vs BVP",
+    "Pr(OR < 0.90): at least 10% relative mortality reduction",
+    "Pr(OR > 1.10): at least 10% relative mortality increase"
+  ),
+  probability = c(p_benefit, p_meaningful, p_harm),
+  calibrated_language = c(
+    calibrated_language(p_benefit),
+    calibrated_language(p_meaningful),
+    calibrated_language(p_harm)
+  )
+)
+
+knitr::kable(
+  interpretation_tbl |> dplyr::mutate(probability = round(probability, 3)),
+  caption = "Interpretation uses probability-calibrated language rather than binary significance labels."
+)
+```
+
+Recommended phrasing template for results sections:
+
+- “The posterior probability that CSP reduces mortality versus BVP was `r if (analysis_ok) sprintf('%.1f%%', 100 * p_benefit) else 'NA'`, representing **`r if (analysis_ok) calibrated_language(p_benefit) else 'NA'`**.”
+- “For a clinically meaningful threshold (OR < 0.90), posterior probability was `r if (analysis_ok) sprintf('%.1f%%', 100 * p_meaningful) else 'NA'`; this should be interpreted as probability-weighted evidence, not proof of superiority.”
+
+## `brms` front-end with `cmdstanr` backend cross-check
+
+This section verifies whether a Bayesian hierarchical Gaussian meta-analysis fitted in `brms` yields a similar pooled signal and heterogeneity profile.
+
+```{r}
+if (!analysis_ok) {
+  cat("Cross-check skipped because core analysis packages are unavailable.")
+} else if (!brms_ok) {
+  cat("Cross-check skipped: `brms` and/or `cmdstanr` not installed.")
+} else if (!cmdstan_available) {
+  cat("Cross-check skipped: cmdstan toolchain not configured for `cmdstanr`.")
+}
+```
+
+```{r, eval=analysis_ok && brms_ok && cmdstan_available}
+options(mc.cores = max(1, parallel::detectCores() - 1))
+
+brms_df <- mor_es |>
+  dplyr::transmute(
+    study = factor(study),
+    yi = yi,
+    sei = sei
+  )
+
+# Priors chosen to approximately align with the reference bayesmeta model.
+brms_priors <- c(
+  brms::prior(
+    normal(ref_prior$mu_mean, ref_prior$mu_sd),
+    class = "Intercept"
+  ),
+  brms::prior(normal(0, 0.5), class = "sd")
+)
+
+brms_fit <- brms::brm(
+  formula = yi | se(sei, sigma = TRUE) ~ 1 + (1 | study),
+  data = brms_df,
+  family = gaussian(),
+  prior = brms_priors,
+  backend = "cmdstanr",
+  chains = 4,
+  iter = 3000,
+  warmup = 1500,
+  seed = 20260418,
+  refresh = 0
+)
+
+brms_draws <- posterior::as_draws_df(brms_fit)
+
+compare_tbl <- tibble::tibble(
+  engine = c("bayesmeta", "brms+cmdstanr"),
+  mu_mean = c(mean(ref_draws$mu), mean(brms_draws$b_Intercept)),
+  mu_low95 = c(quantile(ref_draws$mu, 0.025), quantile(brms_draws$b_Intercept, 0.025)),
+  mu_high95 = c(quantile(ref_draws$mu, 0.975), quantile(brms_draws$b_Intercept, 0.975)),
+  tau_mean = c(mean(ref_draws$tau), mean(brms_draws$sd_study__Intercept)),
+  tau_low95 = c(quantile(ref_draws$tau, 0.025), quantile(brms_draws$sd_study__Intercept, 0.025)),
+  tau_high95 = c(quantile(ref_draws$tau, 0.975), quantile(brms_draws$sd_study__Intercept, 0.975)),
+  pr_or_lt_1 = c(mean(exp(ref_draws$mu) < 1), mean(exp(brms_draws$b_Intercept) < 1))
+)
+
+knitr::kable(
+  compare_tbl |>
+    dplyr::mutate(
+      dplyr::across(where(is.numeric), ~ round(.x, 3))
+    ),
+  caption = "Cross-check of pooled effect and heterogeneity: bayesmeta vs brms+cmdstanr."
+)
+```
+
+Cross-check caveat: `brms` cannot directly consume the exact Turner empirical heterogeneity prior as a simple built-in prior family, so this section uses an approximately aligned half-normal prior on the random-effect SD.
+
+## Summary
+
+This audit adds a transparent, uncertainty-aware extension to `Mortality EP.Rmd` by:
+
+- making prior choices clinically interpretable on OR and log-OR scales,
+- quantifying prior sensitivity,
+- checking model fit with posterior predictive diagnostics,
+- using calibrated probability language for conclusions, and
+- optionally validating pooled inference through an independent `brms`/`cmdstanr` implementation.
+
+## Session information
+
+```{r}
+sessionInfo()
+```
